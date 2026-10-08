@@ -1,0 +1,9 @@
+# Minimum versions (ranges, so they install cleanly on Python 3.10 - 3.13 on Windows)
+oracledb>=2.5
+python-dotenv>=1.0
+pandas>=2.2
+numpy>=1.26
+openpyxl>=3.1      # read/write .xlsx
+xlrd>=2.0.1        # read legacy .xls
+requests>=2.31
+pytest>=8.0

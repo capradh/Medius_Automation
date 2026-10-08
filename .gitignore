@@ -1,0 +1,22 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+# Data in/out (may contain sensitive data) - only keep folder placeholders and samples
+output/*
+!output/.gitkeep
+input/*
+!input/.gitkeep
+!input/sample_*
+logs/*
+!logs/.gitkeep
+# Oracle wallets / secrets
+wallet/
+*.sso
+*.p12
+*.xlsx
+*.xls
+*.csv

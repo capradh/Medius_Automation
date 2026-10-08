@@ -1,0 +1,128 @@
+{
+  "version": "0.2.0",
+  "inputs": [
+    {
+      "id": "db",
+      "type": "promptString",
+      "description": "Database name (e.g. corsair, lara)",
+      "default": "corsair"
+    },
+    {
+      "id": "job",
+      "type": "promptString",
+      "description": "Job name (e.g. daily_report)",
+      "default": "daily_report"
+    },
+    {
+      "id": "inputfile",
+      "type": "promptString",
+      "description": "Input file or folder",
+      "default": "input"
+    },
+    {
+      "id": "apiurl",
+      "type": "promptString",
+      "description": "API URL or path",
+      "default": "/posts"
+    },
+    {
+      "id": "sqlfile",
+      "type": "promptString",
+      "description": "SQL file",
+      "default": "sql/example_orders.sql"
+    }
+  ],
+  "configurations": [
+    {
+      "name": "Test DB connectivity (all)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/scripts/test_db_connectivity.py",
+      "console": "integratedTerminal",
+      "envFile": "${workspaceFolder}/.env"
+    },
+    {
+      "name": "Test DB connectivity (one)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/scripts/test_db_connectivity.py",
+      "args": [
+        "${input:db}"
+      ],
+      "console": "integratedTerminal",
+      "envFile": "${workspaceFolder}/.env"
+    },
+    {
+      "name": "Run job (dry run)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/scripts/run_job.py",
+      "args": [
+        "${input:job}",
+        "--db",
+        "${input:db}"
+      ],
+      "console": "integratedTerminal",
+      "envFile": "${workspaceFolder}/.env"
+    },
+    {
+      "name": "Process file(s) -> Excel",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/scripts/run_job.py",
+      "args": [
+        "process_file",
+        "-i",
+        "${input:inputfile}"
+      ],
+      "console": "integratedTerminal",
+      "envFile": "${workspaceFolder}/.env"
+    },
+    {
+      "name": "DB query -> Excel",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/scripts/run_job.py",
+      "args": [
+        "db_to_excel",
+        "--db",
+        "${input:db}",
+        "--sql-file",
+        "${input:sqlfile}"
+      ],
+      "console": "integratedTerminal",
+      "envFile": "${workspaceFolder}/.env"
+    },
+    {
+      "name": "API -> Excel",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/scripts/run_job.py",
+      "args": [
+        "fetch_api",
+        "--url",
+        "${input:apiurl}"
+      ],
+      "console": "integratedTerminal",
+      "envFile": "${workspaceFolder}/.env"
+    },
+    {
+      "name": "Test email",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/scripts/test_email.py",
+      "args": [],
+      "console": "integratedTerminal",
+      "envFile": "${workspaceFolder}/.env"
+    },
+    {
+      "name": "Test API",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/scripts/test_api.py",
+      "args": [],
+      "console": "integratedTerminal",
+      "envFile": "${workspaceFolder}/.env"
+    }
+  ]
+}
