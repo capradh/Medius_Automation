@@ -1,4 +1,4 @@
-# Oracle Automation Toolkit
+# Automation Toolkit
 
 Python automation for multiple Oracle databases (CORSAIR, LARA, ...), file processing (csv / xls / xlsx / json -> Excel),
 REST APIs, pandas / numpy calculations and email notifications.
