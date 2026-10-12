@@ -111,6 +111,8 @@ GR_COLUMNS = [
     "Medius Delivery Note (Extracted Text)",
     "Medius Company Code",
     "GR Match Status",
+    "Action Required",
+    "Comments",
 ]
 
 
@@ -742,7 +744,12 @@ def find_receipts_in_note(
     return hits
 
 
-def reconcile_gr(cm_gr: pd.DataFrame, me_gr: pd.DataFrame) -> pd.DataFrame:
+def reconcile_gr(
+    cm_gr: pd.DataFrame,
+    me_gr: pd.DataFrame,
+    transfer: pd.Series | None = None,
+    invoice: pd.Series | None = None,
+) -> pd.DataFrame:
     """CMONA GR is the master: every unique receipt appears once; match = id found inside a Delivery Note."""
     keys = set(cm_gr["key"])
     lengths = sorted({len(k) for k in keys})
@@ -774,6 +781,35 @@ def reconcile_gr(cm_gr: pd.DataFrame, me_gr: pd.DataFrame) -> pd.DataFrame:
         .sort_values("order")
     )
     found = m["extracted"].notna().to_numpy()
+
+    # ---- Lif2 error report lookup for unmatched GRs (same logic as PO sheet)
+    transfer = transfer if transfer is not None else pd.Series(dtype=object)
+    invoice = invoice if invoice is not None else pd.Series(dtype=object)
+    t_msg = (
+        m["key"].map(transfer)
+        if len(transfer)
+        else pd.Series(np.nan, index=m.index, dtype=object)
+    )
+    i_msg = (
+        m["key"].map(invoice)
+        if len(invoice)
+        else pd.Series(np.nan, index=m.index, dtype=object)
+    )
+    in_t = (
+        ~found & t_msg.notna().to_numpy()
+    )  # 1) TRANSFER DETAILS (Source Transaction ID)
+    in_i = ~found & ~in_t & i_msg.notna().to_numpy()  # 2) INVOICE DETAILS (Source ID)
+
+    action = np.select(
+        [found, in_t | in_i],
+        ["Not Required", "Checked"],
+        default="Need Investigation",  # 3) not found in either sheet
+    )
+    comments = [  # 4) comment only for "Checked", blank otherwise
+        _po_comment(a, t, i)
+        for a, t, i in zip(action, t_msg.to_numpy(), i_msg.to_numpy())
+    ]
+
     return pd.DataFrame(
         {
             GR_COLUMNS[0]: m["receipt"].to_numpy(),
@@ -782,6 +818,8 @@ def reconcile_gr(cm_gr: pd.DataFrame, me_gr: pd.DataFrame) -> pd.DataFrame:
             GR_COLUMNS[3]: m["extracted"].where(found, NA).to_numpy(),
             GR_COLUMNS[4]: m["medius_company"].where(found, NA).fillna(NA).to_numpy(),
             GR_COLUMNS[5]: np.where(found, "TRUE", NA),
+            GR_COLUMNS[6]: action,
+            GR_COLUMNS[7]: comments,
         }
     )
 
@@ -875,7 +913,7 @@ def write_report(
     _check_row_limit(SHEET_GR, len(gr))
     path.parent.mkdir(parents=True, exist_ok=True)
     po_out = _escape_formulas(po, [PO_COLUMNS[9]])
-    gr_out = _escape_formulas(gr, [GR_COLUMNS[3]])
+    gr_out = _escape_formulas(gr, [GR_COLUMNS[3], GR_COLUMNS[7]])
     with pd.ExcelWriter(path, engine="openpyxl") as writer:
         # ---- Sheet 1: combined Cmona / Medius group header on row 1, column headers on row 2
         po_out.to_excel(writer, sheet_name=SHEET_PO, index=False, startrow=1)
@@ -905,6 +943,7 @@ def write_report(
         ws.auto_filter.ref = ws.dimensions
         ws.freeze_panes = "A2"
         _autosize(ws, 1)
+        ws.column_dimensions["H"].width = 70  # Comments
 
         # ---- Sheet 3: metrics + execution summary
         summary.to_excel(writer, sheet_name=SHEET_SUMMARY, index=False)
@@ -1017,7 +1056,7 @@ def _execute(args, started: datetime) -> JobResult:
         tolerance,
     )
     cm_gr_unique = prepare_cmona_gr(cm_gr)
-    gr = reconcile_gr(cm_gr_unique, me_gr)
+    gr = reconcile_gr(cm_gr_unique, me_gr, transfer, invoice)
     summary = build_po_summary(cm_po, me_po, po)
 
     # 4) execution summary (logs + report)
@@ -1032,6 +1071,14 @@ def _execute(args, started: datetime) -> JobResult:
         ("GR - unique CMONA receipts", len(gr)),
         ("GR - matched", gr_matched),
         ("GR - unmatched", len(gr) - gr_matched),
+        (
+            "GR - unmatched, checked (Lif2)",
+            int((gr["Action Required"] == "Checked").sum()),
+        ),
+        (
+            "GR - unmatched, need investigation",
+            int((gr["Action Required"] == "Need Investigation").sum()),
+        ),
     ]
     execution = pd.DataFrame(exec_rows, columns=["Execution Summary", "Value"]).astype(
         {"Value": str}
