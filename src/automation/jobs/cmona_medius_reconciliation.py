@@ -146,6 +146,7 @@ LINE_COLUMNS = [
     "Amount Match Status",
     "Action Required",
     "Review Reason",
+    "Comments",
 ]
 
 GR_COLUMNS = [
@@ -680,11 +681,7 @@ def build_error_map(df: pd.DataFrame, key_col: str = N_SRC_TXN) -> pd.Series:
     return work.groupby("key", sort=False)["msg"].agg(" | ".join)
 
 
-def _po_comment(action: str, t_msg: object, i_msg: object) -> str:
-    """Return all matching Lif2 messages, one sheet/message per line."""
-    if action != "Checked":
-        return ""
-
+def _lif2_comments(t_msg: object, i_msg: object) -> str:
     messages: list[str] = []
 
     if isinstance(t_msg, str) and t_msg.strip():
@@ -693,6 +690,20 @@ def _po_comment(action: str, t_msg: object, i_msg: object) -> str:
     if isinstance(i_msg, str) and i_msg.strip():
         messages.append(f"{SHEET_INVOICE}: {i_msg}")
 
+    return _truncate("\n".join(messages))
+
+
+def _po_comment(action: str, t_msg: object, i_msg: object) -> str:
+    """Return Lif2 messages for unmatched POs and amount mismatches."""
+    if action not in {"Checked", "Amount Mismatch"}:
+        return ""
+
+    messages = []
+    if action == "Amount Mismatch":
+        messages.append("MEDIUS ERROR: Amount is mismatch")
+    lif2_comments = _lif2_comments(t_msg, i_msg)
+    if lif2_comments:
+        messages.append(lif2_comments)
     return _truncate("\n".join(messages))
 
 
@@ -819,9 +830,13 @@ def reconcile_po_lines(
     cmona: pd.DataFrame,
     medius: pd.DataFrame,
     tolerance: float = DEFAULT_TOLERANCE,
+    transfer: pd.Series | None = None,
+    invoice: pd.Series | None = None,
 ) -> pd.DataFrame:
     """One-to-one line matching within each PO; every CMONA line is retained."""
     cm, me = _line_frames(cmona, medius)
+    transfer = transfer if transfer is not None else pd.Series(dtype=object)
+    invoice = invoice if invoice is not None else pd.Series(dtype=object)
     assignments: dict[int, tuple[int, str]] = {}
 
     for po_key, cmona_group in cm.groupby("po", sort=False):
@@ -1001,6 +1016,20 @@ def reconcile_po_lines(
         amount_ok = matched and _numbers_match(
             cmona_row["amount"], medius_row["amount"], tolerance
         )
+        action = (
+            ("Not Required" if amount_ok else "Amount Mismatch")
+            if matched
+            else "Manual Review"
+        )
+        comments = []
+        if not matched or action == "Amount Mismatch":
+            transfer_message = transfer.get(cmona_row["po"], "")
+            invoice_message = invoice.get(cmona_row["po"], "")
+            lif2_comments = _lif2_comments(transfer_message, invoice_message)
+            if lif2_comments:
+                comments.append(lif2_comments)
+        if action == "Amount Mismatch":
+            comments.insert(0, "MEDIUS ERROR: Amount is mismatch")
         rows.append(
             {
                 LINE_COLUMNS[0]: cmona_row["po_display"],
@@ -1013,10 +1042,9 @@ def reconcile_po_lines(
                 LINE_COLUMNS[7]: medius_row["amount"] if matched else NA,
                 LINE_COLUMNS[8]: "TRUE" if matched else NA,
                 LINE_COLUMNS[9]: ("TRUE" if amount_ok else "FALSE") if matched else NA,
-                LINE_COLUMNS[10]: ("Not Required" if amount_ok else "Amount Mismatch")
-                if matched
-                else "Manual Review",
+                LINE_COLUMNS[10]: action,
                 LINE_COLUMNS[11]: reason,
+                LINE_COLUMNS[12]: _truncate("\n".join(comments)),
             }
         )
     return pd.DataFrame(rows, columns=LINE_COLUMNS)
@@ -1283,6 +1311,7 @@ def write_report(
     _check_row_limit(SHEET_GR, len(gr))
     path.parent.mkdir(parents=True, exist_ok=True)
     po_out = _escape_formulas(po, [PO_COLUMNS[10]])
+    po_lines_out = _escape_formulas(po_lines, [LINE_COLUMNS[12]])
     gr_out = _escape_formulas(gr, [GR_COLUMNS[3], GR_COLUMNS[8]])
 
     with pd.ExcelWriter(path, engine="openpyxl") as writer:
@@ -1317,15 +1346,15 @@ def write_report(
                     ws.cell(row=r, column=c).number_format = "#,##0.00"
 
         # ---- Sheet 2: PO line-item reconciliation
-        po_lines.to_excel(writer, sheet_name=SHEET_LINE, index=False, startrow=1)
+        po_lines_out.to_excel(writer, sheet_name=SHEET_LINE, index=False, startrow=1)
         ws = writer.sheets[SHEET_LINE]
         ws.merge_cells("A1:D1")
         ws.merge_cells("E1:H1")
-        ws.merge_cells("I1:L1")
+        ws.merge_cells("I1:M1")
         ws["A1"], ws["E1"], ws["I1"] = "Cmona", "Medius", "Reconciliation"
         _style_header(ws, 1, 1, 4, _CM_FILL)
         _style_header(ws, 1, 5, 8, _ME_FILL)
-        _style_header(ws, 1, 9, 12, _GREY_FILL)
+        _style_header(ws, 1, 9, 13, _GREY_FILL)
         _style_header(ws, 2, 1, len(LINE_COLUMNS))
         ws.auto_filter.ref = (
             f"A2:{ws.cell(row=2, column=len(LINE_COLUMNS)).column_letter}"
@@ -1334,13 +1363,16 @@ def write_report(
         ws.freeze_panes = "A3"
         _autosize(ws, 2)
         ws.column_dimensions["L"].width = 40
+        ws.column_dimensions["M"].width = 70
         if len(po_lines) <= STYLE_CELL_LIMIT:
             for row in range(3, len(po_lines) + 3):
                 for col in (3, 4, 7, 8):
                     ws.cell(row=row, column=col).number_format = "#,##0.00"
-                ws.cell(row=row, column=12).alignment = Alignment(
-                    vertical="top", wrap_text=True
-                )
+                for col in (12, 13):
+                    ws.cell(row=row, column=col).alignment = Alignment(
+                        vertical="top",
+                        wrap_text=True,
+                    )
 
         # ---- Sheet 3: Cmona / Medius group header on row 1
         gr_out.to_excel(
@@ -1483,7 +1515,7 @@ def _execute(args, started: datetime) -> JobResult:
         invoice,
         tolerance,
     )
-    po_lines = reconcile_po_lines(cm_po, me_po, tolerance)
+    po_lines = reconcile_po_lines(cm_po, me_po, tolerance, transfer, invoice)
     cm_gr_unique = prepare_cmona_gr(cm_gr)
     gr = reconcile_gr(cm_gr_unique, me_gr, transfer, invoice)
     summary = build_po_summary(cm_po, me_po, po)

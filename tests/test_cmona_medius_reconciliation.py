@@ -15,6 +15,7 @@ from automation.jobs.cmona_medius_reconciliation import (
     N_CM_UNIT,
     N_ME_AMT,
     N_ME_CO,
+    N_ME_IMPORTED_TS,
     N_ME_ITEM,
     N_ME_ORDER,
     N_ME_UNIT,
@@ -22,8 +23,10 @@ from automation.jobs.cmona_medius_reconciliation import (
     N_SRC_ID,
     N_SRC_TXN,
     PO_COLUMNS,
+    SHEET_INVOICE,
     SHEET_LINE,
     SHEET_PO,
+    SHEET_TRANSFER,
     aggregate_cmona_po,
     aggregate_medius_po,
     build_error_map,
@@ -182,6 +185,86 @@ def test_duplicate_identical_lines_are_mapped_with_ambiguity_note():
     ]
 
 
+def test_line_review_reason_includes_lif2_messages_by_po():
+    cmona = pd.DataFrame(
+        {
+            N_CM_PO_ID: ["P1", "P2"],
+            N_CM_ITEM: ["ITEM-1", "ITEM-2"],
+            N_CM_UNIT: ["1", "1"],
+            N_CM_AMT: ["120", "120"],
+        }
+    )
+    medius = pd.DataFrame(
+        {
+            N_ME_ORDER: ["P1", "P2"],
+            N_ME_ITEM: ["OTHER-ITEM", "ITEM-2"],
+            N_ME_UNIT: ["9", "1"],
+            N_ME_AMT: ["999", "100"],
+        }
+    )
+    transfer = build_error_map(
+        pd.DataFrame(
+            {
+                N_SRC_TXN: ["P1", "P2"],
+                N_MSG: ["transfer missing", "amount error"],
+            }
+        )
+    )
+    invoice = build_error_map(
+        pd.DataFrame({N_SRC_ID: ["P1"], N_MSG: ["invoice missing"]}),
+        N_SRC_ID,
+    )
+
+    result = reconcile_po_lines(cmona, medius, transfer=transfer, invoice=invoice)
+    unmatched = result.iloc[0]
+    amount_mismatch = result.iloc[1]
+
+    assert unmatched["Line Match Status"] == "NA"
+    assert unmatched["Review Reason"] == "Best score below 40"
+    assert unmatched["Comments"].startswith(f"{SHEET_TRANSFER}: transfer missing")
+    assert f"{SHEET_INVOICE}: invoice missing" in unmatched["Comments"]
+    assert amount_mismatch["Action Required"] == "Amount Mismatch"
+    assert amount_mismatch["Review Reason"] == ""
+    assert amount_mismatch["Comments"].startswith("MEDIUS ERROR: Amount is mismatch")
+    assert f"{SHEET_TRANSFER}: amount error" in amount_mismatch["Comments"]
+    assert amount_mismatch["Comments"] == (
+        f"MEDIUS ERROR: Amount is mismatch\n{SHEET_TRANSFER}: amount error"
+    )
+
+
+def test_po_amount_mismatch_comment_uses_medius_error_prefix():
+    cmona = pd.DataFrame(
+        {
+            N_CM_PO_ID: ["P1"],
+            N_CM_BU: ["1000"],
+            N_CM_AMT: ["120"],
+        }
+    )
+    medius = pd.DataFrame(
+        {
+            N_ME_ORDER: ["P1"],
+            N_ME_CO: ["1000"],
+            N_ME_AMT: ["100"],
+            N_ME_IMPORTED_TS: ["2026-10-21"],
+        }
+    )
+    transfer = build_error_map(
+        pd.DataFrame({N_SRC_TXN: ["P1"], N_MSG: ["amount error"]})
+    )
+
+    result = reconcile_po(
+        aggregate_cmona_po(cmona),
+        aggregate_medius_po(medius),
+        transfer,
+        pd.Series(dtype=object),
+    )
+
+    assert result.loc[0, "Action Required"] == "Amount Mismatch"
+    assert result.loc[0, "Comments"] == (
+        f"MEDIUS ERROR: Amount is mismatch\n{SHEET_TRANSFER}: amount error"
+    )
+
+
 def test_find_receipts_respects_boundaries():
     keys, lengths = {"123", "RCT9"}, [3, 4]
     assert [h[0] for h in find_receipts_in_note("DN123 ok", keys, lengths)] == ["123"]
@@ -229,4 +312,5 @@ def test_report_omits_requested_columns(tmp_path):
     assert "Match score" not in po_headers
     assert not removed_line_columns.intersection(line_headers)
     assert "Match score" not in line_headers
+    assert "Comments" in line_headers
     workbook.close()
