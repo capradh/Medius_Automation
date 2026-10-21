@@ -1,20 +1,29 @@
 import pandas as pd
 import pytest
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 
 from automation.jobs.cmona_medius_reconciliation import (
     COL_CM_PO,
     COL_LIF2_INVOICE,
     COL_LIF2_TRANSFER,
+    GR_COLUMNS,
+    LINE_COLUMNS,
     N_CM_AMT,
-    N_SRC_ID,
     N_CM_BU,
+    N_CM_ITEM,
     N_CM_PO_ID,
+    N_CM_UNIT,
     N_ME_AMT,
     N_ME_CO,
+    N_ME_ITEM,
     N_ME_ORDER,
+    N_ME_UNIT,
     N_MSG,
+    N_SRC_ID,
     N_SRC_TXN,
+    PO_COLUMNS,
+    SHEET_LINE,
+    SHEET_PO,
     aggregate_cmona_po,
     aggregate_medius_po,
     build_error_map,
@@ -24,6 +33,8 @@ from automation.jobs.cmona_medius_reconciliation import (
     FILE_SPECS,
     parse_amount_value,
     reconcile_po,
+    reconcile_po_lines,
+    write_report,
 )
 
 
@@ -140,6 +151,37 @@ def test_amount_mismatch():
     ].tolist() == ["FALSE"]
 
 
+def test_duplicate_identical_lines_are_mapped_with_ambiguity_note():
+    cmona = pd.DataFrame(
+        {
+            N_CM_PO_ID: ["AR118630", "AR118630"],
+            N_CM_ITEM: ["O0801", "O0801"],
+            N_CM_UNIT: ["1", "1"],
+            N_CM_AMT: ["120", "120"],
+        }
+    )
+    medius = pd.DataFrame(
+        {
+            N_ME_ORDER: ["AR118630", "AR118630"],
+            N_ME_ITEM: ["O0801", "O0801"],
+            N_ME_UNIT: ["1", "1"],
+            N_ME_AMT: ["120", "120"],
+        }
+    )
+
+    result = reconcile_po_lines(cmona, medius)
+
+    assert len(result) == 2
+    assert result["Line Match Status"].tolist() == ["TRUE", "TRUE"]
+    assert result["Medius Item Number"].tolist() == ["O0801", "O0801"]
+    assert result["Medius Item Quantity"].tolist() == [1, 1]
+    assert result["Medius Ordered Amount"].tolist() == [120, 120]
+    assert result["Review Reason"].tolist() == [
+        "Ambiguous candidates",
+        "Ambiguous candidates",
+    ]
+
+
 def test_find_receipts_respects_boundaries():
     keys, lengths = {"123", "RCT9"}, [3, 4]
     assert [h[0] for h in find_receipts_in_note("DN123 ok", keys, lengths)] == ["123"]
@@ -155,3 +197,36 @@ def test_filename_patterns():
     assert not matches_spec(Path("CMONA_GR_report.xlsx"), specs["cmona_po"])
     assert matches_spec(Path("Medius GR 2026.xls"), specs["medius_gr"])
     assert matches_spec(Path("LIF2_errors.csv"), specs["lif2"])
+
+
+def test_report_omits_requested_columns(tmp_path):
+    report_path = tmp_path / "report.xlsx"
+    write_report(
+        report_path,
+        pd.DataFrame(columns=PO_COLUMNS),
+        pd.DataFrame(columns=LINE_COLUMNS),
+        pd.DataFrame(columns=GR_COLUMNS),
+        pd.DataFrame(columns=["Metric", "Value"]),
+        pd.DataFrame(columns=["Execution Summary", "Value"]),
+    )
+
+    workbook = load_workbook(report_path, read_only=True)
+    po_headers = next(
+        workbook[SHEET_PO].iter_rows(min_row=2, max_row=2, values_only=True)
+    )
+    line_headers = next(
+        workbook[SHEET_LINE].iter_rows(min_row=2, max_row=2, values_only=True)
+    )
+    removed_line_columns = {
+        "CMONA PO Line Number",
+        "Medius Line Number",
+        "Amount Difference",
+        "PO Match Status",
+        "Match Method",
+        "Confidence",
+    }
+
+    assert "Match score" not in po_headers
+    assert not removed_line_columns.intersection(line_headers)
+    assert "Match score" not in line_headers
+    workbook.close()

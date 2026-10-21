@@ -52,9 +52,10 @@ HEADER_SCAN_ROWS = 200
 EXCEL_MAX_ROWS = 1_048_576
 STYLE_CELL_LIMIT = 300_000  # above this many rows, skip per-cell number formatting
 MAX_CELL_CHARS = 32_000
-NULL_TOKENS = frozenset({"", "nan", "none", "null", "na", "n/a", "<na>"})
+NULL_TOKENS = frozenset({"", "-", "'-", "nan", "none", "null", "na", "n/a", "<na>"})
 
-SHEET_PO = "PO Reconciliation"
+SHEET_PO = "PO Header Reconciliation"
+SHEET_LINE = "PO Line Item Reconciliation"
 SHEET_GR = "GR Reconciliation"
 SHEET_SUMMARY = "PO Summary"
 SHEET_TRANSFER = "TRANSFER DETAILS"
@@ -74,7 +75,13 @@ def norm_col(name: object) -> str:
 
 
 # Required source columns (as named in the reports) and their standardised names
-COL_CM_PO = ("PO Id", "Business Unit Id", "sum(PO Spend in Original Currency)")
+COL_CM_PO = (
+    "PO Id",
+    "Business Unit Id",
+    "sum(PO Spend in Original Currency)",
+    "Internal Order - Internal Order Id",
+    "sum(Line Count)",
+)
 COL_CM_GR = (
     "[RCT] Receipt Id",
     "[PO-P&I] PO Id",
@@ -85,6 +92,8 @@ COL_ME_PO = (
     "Purchase Order: Company",
     "Ordered Amount",
     "Purchase Order: Imported Timestamp",
+    "Item Number",
+    "Ordered Unit Price",
 )
 COL_ME_GR = (
     "Delivery Note",
@@ -94,10 +103,17 @@ COL_ME_GR = (
 COL_LIF2_TRANSFER = ("Source Transaction ID", "Message Text")  # TRANSFER DETAILS
 COL_LIF2_INVOICE = ("Source ID", "Message Text")  # INVOICE DETAILS
 
-N_CM_PO_ID, N_CM_BU, N_CM_AMT = (norm_col(c) for c in COL_CM_PO)
+N_CM_PO_ID, N_CM_BU, N_CM_AMT, N_CM_ITEM, N_CM_UNIT = (norm_col(c) for c in COL_CM_PO)
 N_CM_RCT, N_CM_GR_PO, N_CM_GR_CO = (norm_col(c) for c in COL_CM_GR)
 
-N_ME_ORDER, N_ME_CO, N_ME_AMT, N_ME_IMPORTED_TS = (norm_col(c) for c in COL_ME_PO)
+(
+    N_ME_ORDER,
+    N_ME_CO,
+    N_ME_AMT,
+    N_ME_IMPORTED_TS,
+    N_ME_ITEM,
+    N_ME_UNIT,
+) = (norm_col(c) for c in COL_ME_PO)
 N_ME_NOTE, N_ME_GR_CO, N_ME_GR_IMPORTED_TS = (norm_col(c) for c in COL_ME_GR)
 
 N_SRC_TXN, N_MSG = (norm_col(c) for c in COL_LIF2_TRANSFER)
@@ -115,6 +131,21 @@ PO_COLUMNS = [
     "Amount Match Status",
     "Action Required",
     "Comments",
+]
+
+LINE_COLUMNS = [
+    "Cmona PO ID",
+    "CMONA Internal Order ID",
+    "CMONA Item Quantity",
+    "CMONA Amount",
+    "Medius Order Identifier",
+    "Medius Item Number",
+    "Medius Item Quantity",
+    "Medius Ordered Amount",
+    "Line Match Status",
+    "Amount Match Status",
+    "Action Required",
+    "Review Reason",
 ]
 
 GR_COLUMNS = [
@@ -722,6 +753,276 @@ def reconcile_po(
 
 
 # --------------------------------------------------------------------------- #
+# PO line-item reconciliation (CMONA is master)
+# --------------------------------------------------------------------------- #
+def _line_frames(
+    cmona: pd.DataFrame, medius: pd.DataFrame
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    cmona_po = po_without_suffix(cmona[N_CM_PO_ID])
+    medius_po = po_without_suffix(medius[N_ME_ORDER])
+
+    cm = pd.DataFrame(
+        {
+            "po": normalize_id(cmona_po),
+            "po_display": cmona_po,
+            "item": normalize_id(cmona[N_CM_ITEM]),
+            "item_display": cmona[N_CM_ITEM],
+            "unit": parse_amount(cmona[N_CM_UNIT], "CMONA Item Quantity"),
+            "amount": parse_amount(cmona[N_CM_AMT], "CMONA line amount"),
+            "source_order": np.arange(len(cmona)),
+        }
+    )
+    me = pd.DataFrame(
+        {
+            "po": normalize_id(medius_po),
+            "po_display": medius_po,
+            "item": normalize_id(medius[N_ME_ITEM]),
+            "item_display": medius[N_ME_ITEM],
+            "unit": parse_amount(medius[N_ME_UNIT], "Medius Item Quantity"),
+            "amount": parse_amount(medius[N_ME_AMT], "Medius line amount"),
+            "source_order": np.arange(len(medius)),
+        }
+    )
+    return (
+        cm.loc[cm["po"] != NA].reset_index(drop=True),
+        me.loc[me["po"] != NA].reset_index(drop=True),
+    )
+
+
+def _numbers_match(a: float, b: float, tolerance: float) -> bool:
+    return pd.notna(a) and pd.notna(b) and abs(float(a) - float(b)) <= tolerance + 1e-9
+
+
+def _line_pair_score(
+    cmona_row: pd.Series,
+    medius_row: pd.Series,
+    cmona_position: int,
+    medius_position: int,
+    tolerance: float,
+) -> int:
+    score = 0
+    if cmona_row["item"] != NA and medius_row["item"] != NA:
+        score += 50 if cmona_row["item"] == medius_row["item"] else -40
+    elif cmona_row["item"] == NA and medius_row["item"] == NA:
+        score += 10
+    if _numbers_match(cmona_row["unit"], medius_row["unit"], tolerance):
+        score += 25
+    if _numbers_match(cmona_row["amount"], medius_row["amount"], tolerance):
+        score += 20
+    # Weak tie-breaker only; no assumption that 1 means 10.
+    if cmona_position == medius_position:
+        score += 5
+    return max(0, min(100, score))
+
+
+def reconcile_po_lines(
+    cmona: pd.DataFrame,
+    medius: pd.DataFrame,
+    tolerance: float = DEFAULT_TOLERANCE,
+) -> pd.DataFrame:
+    """One-to-one line matching within each PO; every CMONA line is retained."""
+    cm, me = _line_frames(cmona, medius)
+    assignments: dict[int, tuple[int, str]] = {}
+
+    for po_key, cmona_group in cm.groupby("po", sort=False):
+        medius_group = me.loc[me["po"] == po_key]
+        unused_cmona = set(cmona_group.index)
+        unused_medius = set(medius_group.index)
+        cmona_position = {
+            index: position
+            for position, index in enumerate(
+                cmona_group.sort_values("source_order").index
+            )
+        }
+        medius_position = {
+            index: position
+            for position, index in enumerate(
+                medius_group.sort_values("source_order").index
+            )
+        }
+
+        cmona_exact: dict[tuple[str, float, float], list[int]] = {}
+        medius_exact: dict[tuple[str, float, float], list[int]] = {}
+
+        def exact_signature(row: pd.Series) -> tuple[str, float, float] | None:
+            if row["item"] == NA or pd.isna(row["unit"]) or pd.isna(row["amount"]):
+                return None
+            return row["item"], float(row["unit"]), float(row["amount"])
+
+        for index in unused_cmona:
+            signature = exact_signature(cm.loc[index])
+            if signature is not None:
+                cmona_exact.setdefault(signature, []).append(index)
+        for index in unused_medius:
+            signature = exact_signature(me.loc[index])
+            if signature is not None:
+                medius_exact.setdefault(signature, []).append(index)
+
+        for signature, cmona_indices in cmona_exact.items():
+            medius_indices = medius_exact.get(signature, [])
+            if not medius_indices:
+                continue
+
+            cmona_indices.sort(key=lambda index: cm.loc[index, "source_order"])
+            medius_indices.sort(key=lambda index: me.loc[index, "source_order"])
+            has_duplicates = len(cmona_indices) > 1 or len(medius_indices) > 1
+            for cmona_index, medius_index in zip(cmona_indices, medius_indices):
+                assignments[cmona_index] = (
+                    medius_index,
+                    "Ambiguous candidates" if has_duplicates else "",
+                )
+                unused_cmona.remove(cmona_index)
+                unused_medius.remove(medius_index)
+
+            for cmona_index in cmona_indices[len(medius_indices) :]:
+                assignments[cmona_index] = (-1, "Ambiguous candidates")
+                unused_cmona.remove(cmona_index)
+
+        def assign_unique(predicate) -> None:
+            changed = True
+            while changed:
+                changed = False
+                candidates = {
+                    cmona_index: [
+                        medius_index
+                        for medius_index in unused_medius
+                        if predicate(cm.loc[cmona_index], me.loc[medius_index])
+                    ]
+                    for cmona_index in unused_cmona
+                }
+                reverse = {
+                    medius_index: [
+                        cmona_index
+                        for cmona_index, values in candidates.items()
+                        if medius_index in values
+                    ]
+                    for medius_index in unused_medius
+                }
+                for cmona_index in sorted(
+                    unused_cmona,
+                    key=lambda index: cm.loc[index, "source_order"],
+                ):
+                    values = candidates[cmona_index]
+                    if len(values) == 1 and len(reverse[values[0]]) == 1:
+                        medius_index = values[0]
+                        assignments[cmona_index] = (medius_index, "")
+                        unused_cmona.remove(cmona_index)
+                        unused_medius.remove(medius_index)
+                        changed = True
+                        break
+
+        assign_unique(
+            lambda c, m: (
+                c["item"] != NA
+                and c["item"] == m["item"]
+                and _numbers_match(c["unit"], m["unit"], tolerance)
+                and _numbers_match(c["amount"], m["amount"], tolerance)
+            ),
+        )
+        assign_unique(
+            lambda c, m: (
+                c["item"] != NA
+                and c["item"] == m["item"]
+                and _numbers_match(c["unit"], m["unit"], tolerance)
+            ),
+        )
+
+        # Deterministic one-to-one residual matching. A pair is accepted only
+        # when score >= 40 and both row/column alternatives are at least 10
+        # points worse. Near ties are intentionally left for manual review.
+        while unused_cmona and unused_medius:
+            scored = []
+            for cmona_index in unused_cmona:
+                for medius_index in unused_medius:
+                    score = _line_pair_score(
+                        cm.loc[cmona_index],
+                        me.loc[medius_index],
+                        cmona_position[cmona_index],
+                        medius_position[medius_index],
+                        tolerance,
+                    )
+                    scored.append((score, cmona_index, medius_index))
+            scored.sort(reverse=True)
+            accepted = False
+            for score, cmona_index, medius_index in scored:
+                if score < 40:
+                    break
+                cmona_scores = sorted(
+                    [x[0] for x in scored if x[1] == cmona_index], reverse=True
+                )
+                medius_scores = sorted(
+                    [x[0] for x in scored if x[2] == medius_index], reverse=True
+                )
+                ambiguous = (
+                    len(cmona_scores) > 1 and cmona_scores[0] - cmona_scores[1] < 10
+                ) or (
+                    len(medius_scores) > 1 and medius_scores[0] - medius_scores[1] < 10
+                )
+                if not ambiguous:
+                    assignments[cmona_index] = (
+                        medius_index,
+                        "",
+                    )
+                    unused_cmona.remove(cmona_index)
+                    unused_medius.remove(medius_index)
+                    accepted = True
+                    break
+            if not accepted:
+                break
+
+        for cmona_index in unused_cmona:
+            possible_scores = [
+                _line_pair_score(
+                    cm.loc[cmona_index],
+                    me.loc[medius_index],
+                    cmona_position[cmona_index],
+                    medius_position[medius_index],
+                    tolerance,
+                )
+                for medius_index in unused_medius
+            ]
+            best_score = max(possible_scores, default=0)
+            reason = (
+                "Ambiguous candidates"
+                if best_score >= 40
+                else (
+                    "No Medius line for PO"
+                    if medius_group.empty
+                    else "Best score below 40"
+                )
+            )
+            assignments[cmona_index] = (-1, reason)
+
+    rows: list[dict[str, object]] = []
+    for cmona_index, cmona_row in cm.iterrows():
+        medius_index, reason = assignments[cmona_index]
+        matched = medius_index >= 0
+        medius_row = me.loc[medius_index] if matched else None
+        amount_ok = matched and _numbers_match(
+            cmona_row["amount"], medius_row["amount"], tolerance
+        )
+        rows.append(
+            {
+                LINE_COLUMNS[0]: cmona_row["po_display"],
+                LINE_COLUMNS[1]: cmona_row["item_display"],
+                LINE_COLUMNS[2]: cmona_row["unit"],
+                LINE_COLUMNS[3]: cmona_row["amount"],
+                LINE_COLUMNS[4]: medius_row["po_display"] if matched else NA,
+                LINE_COLUMNS[5]: medius_row["item_display"] if matched else NA,
+                LINE_COLUMNS[6]: medius_row["unit"] if matched else NA,
+                LINE_COLUMNS[7]: medius_row["amount"] if matched else NA,
+                LINE_COLUMNS[8]: "TRUE" if matched else NA,
+                LINE_COLUMNS[9]: ("TRUE" if amount_ok else "FALSE") if matched else NA,
+                LINE_COLUMNS[10]: ("Not Required" if amount_ok else "Amount Mismatch")
+                if matched
+                else "Manual Review",
+                LINE_COLUMNS[11]: reason,
+            }
+        )
+    return pd.DataFrame(rows, columns=LINE_COLUMNS)
+
+
+# --------------------------------------------------------------------------- #
 # GR reconciliation (pure functions)
 # --------------------------------------------------------------------------- #
 def _join_unique(values: pd.Series) -> str:
@@ -972,11 +1273,13 @@ def _check_row_limit(name: str, rows: int) -> None:
 def write_report(
     path: Path,
     po: pd.DataFrame,
+    po_lines: pd.DataFrame,
     gr: pd.DataFrame,
     summary: pd.DataFrame,
     execution: pd.DataFrame,
 ) -> Path:
     _check_row_limit(SHEET_PO, len(po))
+    _check_row_limit(SHEET_LINE, len(po_lines))
     _check_row_limit(SHEET_GR, len(gr))
     path.parent.mkdir(parents=True, exist_ok=True)
     po_out = _escape_formulas(po, [PO_COLUMNS[10]])
@@ -1013,7 +1316,33 @@ def write_report(
                 for c in (3, 6):
                     ws.cell(row=r, column=c).number_format = "#,##0.00"
 
-        # ---- Sheet 2: Cmona / Medius group header on row 1
+        # ---- Sheet 2: PO line-item reconciliation
+        po_lines.to_excel(writer, sheet_name=SHEET_LINE, index=False, startrow=1)
+        ws = writer.sheets[SHEET_LINE]
+        ws.merge_cells("A1:D1")
+        ws.merge_cells("E1:H1")
+        ws.merge_cells("I1:L1")
+        ws["A1"], ws["E1"], ws["I1"] = "Cmona", "Medius", "Reconciliation"
+        _style_header(ws, 1, 1, 4, _CM_FILL)
+        _style_header(ws, 1, 5, 8, _ME_FILL)
+        _style_header(ws, 1, 9, 12, _GREY_FILL)
+        _style_header(ws, 2, 1, len(LINE_COLUMNS))
+        ws.auto_filter.ref = (
+            f"A2:{ws.cell(row=2, column=len(LINE_COLUMNS)).column_letter}"
+            f"{len(po_lines) + 2}"
+        )
+        ws.freeze_panes = "A3"
+        _autosize(ws, 2)
+        ws.column_dimensions["L"].width = 40
+        if len(po_lines) <= STYLE_CELL_LIMIT:
+            for row in range(3, len(po_lines) + 3):
+                for col in (3, 4, 7, 8):
+                    ws.cell(row=row, column=col).number_format = "#,##0.00"
+                ws.cell(row=row, column=12).alignment = Alignment(
+                    vertical="top", wrap_text=True
+                )
+
+        # ---- Sheet 3: Cmona / Medius group header on row 1
         gr_out.to_excel(
             writer,
             sheet_name=SHEET_GR,
@@ -1044,7 +1373,7 @@ def write_report(
                 wrap_text=True,
             )
 
-        # ---- Sheet 3: metrics + execution summary
+        # ---- Sheet 4: metrics + execution summary
         summary.to_excel(writer, sheet_name=SHEET_SUMMARY, index=False)
         execution.to_excel(
             writer, sheet_name=SHEET_SUMMARY, index=False, startrow=len(summary) + 3
@@ -1154,6 +1483,7 @@ def _execute(args, started: datetime) -> JobResult:
         invoice,
         tolerance,
     )
+    po_lines = reconcile_po_lines(cm_po, me_po, tolerance)
     cm_gr_unique = prepare_cmona_gr(cm_gr)
     gr = reconcile_gr(cm_gr_unique, me_gr, transfer, invoice)
     summary = build_po_summary(cm_po, me_po, po)
@@ -1167,6 +1497,16 @@ def _execute(args, started: datetime) -> JobResult:
         ("Duration (seconds)", f"{time.perf_counter() - t0:.1f}"),
         ("Amount tolerance", f"{tolerance}"),
         *[(f"Input - {s.prompt}", files[s.key].name) for s in FILE_SPECS],
+        ("PO lines - CMONA master rows", len(po_lines)),
+        ("PO lines - matched", int((po_lines["Line Match Status"] == "TRUE").sum())),
+        (
+            "PO lines - amount mismatch",
+            int((po_lines["Action Required"] == "Amount Mismatch").sum()),
+        ),
+        (
+            "PO lines - manual review",
+            int((po_lines["Action Required"] == "Manual Review").sum()),
+        ),
         ("GR - unique CMONA receipts", len(gr)),
         ("GR - matched", gr_matched),
         ("GR - unmatched", len(gr) - gr_matched),
@@ -1192,7 +1532,7 @@ def _execute(args, started: datetime) -> JobResult:
 
     # 5) write report straight into the Downloads folder
     out_path = output_dir / f"{REPORT_PREFIX}_{datetime.now():%Y%m%d_%H%M%S}.xlsx"
-    write_report(out_path, po, gr, summary, execution)
+    write_report(out_path, po, po_lines, gr, summary, execution)
     log.info("Report written: %s", out_path)
 
     text = (
