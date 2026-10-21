@@ -80,15 +80,26 @@ COL_CM_GR = (
     "[PO-P&I] PO Id",
     "[PO-P&I]Purchasing Company (Purchase Organization Id)",
 )
-COL_ME_PO = ("Order Identifier 2", "Purchase Order: Company", "Ordered Amount")
-COL_ME_GR = ("Delivery Note", "Purchase Order: Company")
+COL_ME_PO = (
+    "Order Identifier 2",
+    "Purchase Order: Company",
+    "Ordered Amount",
+    "Purchase Order: Imported Timestamp",
+)
+COL_ME_GR = (
+    "Delivery Note",
+    "Purchase Order: Company",
+    "Purchase Order: Imported Timestamp",
+)
 COL_LIF2_TRANSFER = ("Source Transaction ID", "Message Text")  # TRANSFER DETAILS
 COL_LIF2_INVOICE = ("Source ID", "Message Text")  # INVOICE DETAILS
 
 N_CM_PO_ID, N_CM_BU, N_CM_AMT = (norm_col(c) for c in COL_CM_PO)
 N_CM_RCT, N_CM_GR_PO, N_CM_GR_CO = (norm_col(c) for c in COL_CM_GR)
-N_ME_ORDER, N_ME_CO, N_ME_AMT = (norm_col(c) for c in COL_ME_PO)
-N_ME_NOTE, N_ME_GR_CO = (norm_col(c) for c in COL_ME_GR)
+
+N_ME_ORDER, N_ME_CO, N_ME_AMT, N_ME_IMPORTED_TS = (norm_col(c) for c in COL_ME_PO)
+N_ME_NOTE, N_ME_GR_CO, N_ME_GR_IMPORTED_TS = (norm_col(c) for c in COL_ME_GR)
+
 N_SRC_TXN, N_MSG = (norm_col(c) for c in COL_LIF2_TRANSFER)
 N_SRC_ID = norm_col(COL_LIF2_INVOICE[0])
 
@@ -99,17 +110,20 @@ PO_COLUMNS = [
     "Medius Order Identifier",
     "Purchase Order Company",
     "Medius Amount",
+    "Purchase Order: Imported Timestamp",
     "PO Match Status",
     "Amount Match Status",
     "Action Required",
     "Comments",
 ]
+
 GR_COLUMNS = [
     "Cmona [RCT] Receipt Id",
     "Cmona [PO-P&I] PO Id",
     "Cmona [PO-P&I]Purchasing Company (Purchase Organization Id)",
     "Medius Delivery Note (Extracted Text)",
     "Medius Company Code",
+    "Purchase Order: Imported Timestamp",
     "GR Match Status",
     "Action Required",
     "Comments",
@@ -548,6 +562,12 @@ def normalize_id(series: pd.Series) -> pd.Series:
     )
 
 
+def po_without_suffix(series: pd.Series) -> pd.Series:
+    """Remove the first '-' and everything after it: 'PO123-V2' -> 'PO123'."""
+    out = series.astype(str).str.split("-", n=1).str[0].str.strip()
+    return out.mask(out.str.lower().isin(NULL_TOKENS), NA)
+
+
 def company_prefix(series: pd.Series) -> pd.Series:
     """Text before the first '-' ('1000-Company A' -> '1000')."""
     out = series.astype(str).str.split("-", n=1).str[0].str.strip()
@@ -562,16 +582,19 @@ def _truncate(text: str) -> str:
 # PO reconciliation (pure functions)
 # --------------------------------------------------------------------------- #
 def aggregate_cmona_po(df: pd.DataFrame) -> pd.DataFrame:
-    """One row per PO Id: summed amount + first company code."""
+    """One row per suffix-free PO Id: summed amount + first company code."""
+    cmona_ids = po_without_suffix(df[N_CM_PO_ID])
+
     work = pd.DataFrame(
         {
-            "key": normalize_id(df[N_CM_PO_ID]),
-            "cmona_id": df[N_CM_PO_ID],
+            "key": normalize_id(cmona_ids),
+            "cmona_id": cmona_ids,
             "cmona_company": df[N_CM_BU].mask(df[N_CM_BU] == NA),
             "cmona_amount": parse_amount(df[N_CM_AMT], "CMONA PO amount"),
         }
     )
     work = work.loc[work["key"] != NA]
+
     agg = (
         work.groupby("key", sort=False)
         .agg(
@@ -586,26 +609,34 @@ def aggregate_cmona_po(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def aggregate_medius_po(df: pd.DataFrame) -> pd.DataFrame:
-    """One row per Order Identifier 2: summed Ordered Amount + company code (text before '-')."""
+    """One row per suffix-free Order Identifier 2."""
+    medius_ids = po_without_suffix(df[N_ME_ORDER])
+
     work = pd.DataFrame(
         {
-            "key": normalize_id(df[N_ME_ORDER]),
-            "medius_id": df[N_ME_ORDER],
+            "key": normalize_id(medius_ids),
+            "medius_id": medius_ids,
             "medius_company": company_prefix(df[N_ME_CO]).mask(lambda s: s == NA),
             "medius_amount": parse_amount(df[N_ME_AMT], "Medius Ordered Amount"),
+            "medius_imported_timestamp": df[N_ME_IMPORTED_TS],
         }
     )
     work = work.loc[work["key"] != NA]
+
     agg = (
         work.groupby("key", sort=False)
         .agg(
             medius_id=("medius_id", "first"),
             medius_company=("medius_company", "first"),
             medius_amount=("medius_amount", "sum"),
+            medius_imported_timestamp=("medius_imported_timestamp", "first"),
         )
         .reset_index()
     )
+
     agg["medius_company"] = agg["medius_company"].fillna(NA)
+    agg["medius_imported_timestamp"] = agg["medius_imported_timestamp"].fillna(NA)
+
     return agg
 
 
@@ -619,13 +650,19 @@ def build_error_map(df: pd.DataFrame, key_col: str = N_SRC_TXN) -> pd.Series:
 
 
 def _po_comment(action: str, t_msg: object, i_msg: object) -> str:
-    """Comment only for 'Checked' rows: the Lif2 Message Text; every other action stays blank."""
+    """Return all matching Lif2 messages, one sheet/message per line."""
     if action != "Checked":
         return ""
-    sheet, msg = (
-        (SHEET_TRANSFER, t_msg) if isinstance(t_msg, str) else (SHEET_INVOICE, i_msg)
-    )
-    return _truncate(f"[{sheet}] {msg}")
+
+    messages: list[str] = []
+
+    if isinstance(t_msg, str) and t_msg.strip():
+        messages.append(f"{SHEET_TRANSFER}: {t_msg}")
+
+    if isinstance(i_msg, str) and i_msg.strip():
+        messages.append(f"{SHEET_INVOICE}: {i_msg}")
+
+    return _truncate("\n".join(messages))
 
 
 def reconcile_po(
@@ -650,8 +687,9 @@ def reconcile_po(
         if len(invoice)
         else pd.Series(np.nan, index=m.index, dtype=object)
     )
+    # Check both Lif2 sheets independently for unmatched POs.
+    in_i = ~found & i_msg.notna().to_numpy()
     in_t = ~found & t_msg.notna().to_numpy()
-    in_i = ~found & ~in_t & i_msg.notna().to_numpy()
 
     po_status = np.where(found, "TRUE", NA)
     amt_status = np.select([~found, amount_ok], [NA, "TRUE"], default="FALSE")
@@ -671,11 +709,14 @@ def reconcile_po(
             PO_COLUMNS[2]: m["cmona_amount"].round(2),
             PO_COLUMNS[3]: m["medius_id"].where(found, NA),
             PO_COLUMNS[4]: m["medius_company"].where(found, NA),
-            PO_COLUMNS[5]: m["medius_amount"].round(2).astype(object).where(found, NA),
-            PO_COLUMNS[6]: po_status,
-            PO_COLUMNS[7]: amt_status,
-            PO_COLUMNS[8]: action,
-            PO_COLUMNS[9]: comments,
+            PO_COLUMNS[5]: (
+                m["medius_amount"].round(2).astype(object).where(found, NA)
+            ),
+            PO_COLUMNS[6]: m["medius_imported_timestamp"].where(found, NA),
+            PO_COLUMNS[7]: po_status,
+            PO_COLUMNS[8]: amt_status,
+            PO_COLUMNS[9]: action,
+            PO_COLUMNS[10]: comments,
         }
     )
 
@@ -694,7 +735,7 @@ def prepare_cmona_gr(df: pd.DataFrame) -> pd.DataFrame:
         {
             "key": normalize_id(df[N_CM_RCT]),
             "receipt": df[N_CM_RCT],
-            "po": df[N_CM_GR_PO],
+            "po": po_without_suffix(df[N_CM_GR_PO]),
             "company": df[N_CM_GR_CO],
         }
     )
@@ -757,14 +798,37 @@ def reconcile_gr(
         {
             "note": me_gr[N_ME_NOTE],
             "company": company_prefix(me_gr[N_ME_GR_CO]),
+            "imported_timestamp": me_gr[N_ME_GR_IMPORTED_TS],
         }
     ).drop_duplicates()
     pairs = pairs.loc[pairs["note"] != NA]
-    rows: list[tuple[str, str, str, str]] = []
-    for note, company in zip(pairs["note"].to_numpy(), pairs["company"].to_numpy()):
+    rows: list[tuple[str, str, str, str, str]] = []
+    for note, company, imported_timestamp in zip(
+        pairs["note"].to_numpy(),
+        pairs["company"].to_numpy(),
+        pairs["imported_timestamp"].to_numpy(),
+    ):
         for key, extracted in find_receipts_in_note(note, keys, lengths):
-            rows.append((key, extracted, company, note))
-    hits = pd.DataFrame(rows, columns=["key", "extracted", "medius_company", "note"])
+            rows.append(
+                (
+                    key,
+                    extracted,
+                    company,
+                    note,
+                    imported_timestamp,
+                )
+            )
+
+    hits = pd.DataFrame(
+        rows,
+        columns=[
+            "key",
+            "extracted",
+            "medius_company",
+            "note",
+            "medius_imported_timestamp",
+        ],
+    )
     m = cm_gr.merge(hits, on="key", how="left")
     cm_companies = [
         {c.strip().upper() for c in str(v).split(",")} for v in m["company"]
@@ -795,10 +859,9 @@ def reconcile_gr(
         if len(invoice)
         else pd.Series(np.nan, index=m.index, dtype=object)
     )
-    in_t = (
-        ~found & t_msg.notna().to_numpy()
-    )  # 1) TRANSFER DETAILS (Source Transaction ID)
-    in_i = ~found & ~in_t & i_msg.notna().to_numpy()  # 2) INVOICE DETAILS (Source ID)
+    # Check both Lif2 sheets independently for unmatched GRs.
+    in_i = ~found & i_msg.notna().to_numpy()
+    in_t = ~found & t_msg.notna().to_numpy()
 
     action = np.select(
         [found, in_t | in_i],
@@ -816,10 +879,13 @@ def reconcile_gr(
             GR_COLUMNS[1]: m["po"].to_numpy(),
             GR_COLUMNS[2]: m["company"].to_numpy(),
             GR_COLUMNS[3]: m["extracted"].where(found, NA).to_numpy(),
-            GR_COLUMNS[4]: m["medius_company"].where(found, NA).fillna(NA).to_numpy(),
-            GR_COLUMNS[5]: np.where(found, "TRUE", NA),
-            GR_COLUMNS[6]: action,
-            GR_COLUMNS[7]: comments,
+            GR_COLUMNS[4]: (m["medius_company"].where(found, NA).fillna(NA).to_numpy()),
+            GR_COLUMNS[5]: (
+                m["medius_imported_timestamp"].where(found, NA).fillna(NA).to_numpy()
+            ),
+            GR_COLUMNS[6]: np.where(found, "TRUE", NA),
+            GR_COLUMNS[7]: action,
+            GR_COLUMNS[8]: comments,
         }
     )
 
@@ -830,8 +896,9 @@ def reconcile_gr(
 def build_po_summary(
     cm_df: pd.DataFrame, me_df: pd.DataFrame, po: pd.DataFrame
 ) -> pd.DataFrame:
-    cm_keys = normalize_id(cm_df[N_CM_PO_ID])
-    me_keys = normalize_id(me_df[N_ME_ORDER])
+    cm_keys = normalize_id(po_without_suffix(cm_df[N_CM_PO_ID]))
+    me_keys = normalize_id(po_without_suffix(me_df[N_ME_ORDER]))
+
     metrics = [
         ("Total CMONA Rows", len(cm_df)),
         ("Total CMONA PO Count", int((cm_keys != NA).sum())),
@@ -912,38 +979,70 @@ def write_report(
     _check_row_limit(SHEET_PO, len(po))
     _check_row_limit(SHEET_GR, len(gr))
     path.parent.mkdir(parents=True, exist_ok=True)
-    po_out = _escape_formulas(po, [PO_COLUMNS[9]])
-    gr_out = _escape_formulas(gr, [GR_COLUMNS[3], GR_COLUMNS[7]])
+    po_out = _escape_formulas(po, [PO_COLUMNS[10]])
+    gr_out = _escape_formulas(gr, [GR_COLUMNS[3], GR_COLUMNS[8]])
+
     with pd.ExcelWriter(path, engine="openpyxl") as writer:
         # ---- Sheet 1: combined Cmona / Medius group header on row 1, column headers on row 2
         po_out.to_excel(writer, sheet_name=SHEET_PO, index=False, startrow=1)
         ws = writer.sheets[SHEET_PO]
         ws.merge_cells("A1:C1")
-        ws.merge_cells("D1:F1")
+        ws.merge_cells("D1:G1")
         ws["A1"], ws["D1"] = "Cmona", "Medius"
+
         _style_header(ws, 1, 1, 3, _CM_FILL)
-        _style_header(ws, 1, 4, 6, _ME_FILL)
-        _style_header(ws, 1, 7, 10, _GREY_FILL)
+        _style_header(ws, 1, 4, 7, _ME_FILL)
+        _style_header(ws, 1, 8, 11, _GREY_FILL)
+
         _style_header(ws, 2, 1, len(PO_COLUMNS))
         ws.auto_filter.ref = (
             f"A2:{ws.cell(row=2, column=len(PO_COLUMNS)).column_letter}{len(po) + 2}"
         )
         ws.freeze_panes = "A3"
         _autosize(ws, 2)
-        ws.column_dimensions["J"].width = 70
+        ws.column_dimensions["K"].width = 70
+        # Wrap multi-line comments in PO Reconciliation.
+        for row in range(3, len(po) + 3):
+            ws.cell(row=row, column=11).alignment = Alignment(
+                vertical="top",
+                wrap_text=True,
+            )
+
         if len(po) <= STYLE_CELL_LIMIT:
             for r in range(3, len(po) + 3):
                 for c in (3, 6):
                     ws.cell(row=r, column=c).number_format = "#,##0.00"
 
-        # ---- Sheet 2
-        gr_out.to_excel(writer, sheet_name=SHEET_GR, index=False)
+        # ---- Sheet 2: Cmona / Medius group header on row 1
+        gr_out.to_excel(
+            writer,
+            sheet_name=SHEET_GR,
+            index=False,
+            startrow=1,
+        )
         ws = writer.sheets[SHEET_GR]
-        _style_header(ws, 1, 1, len(GR_COLUMNS))
-        ws.auto_filter.ref = ws.dimensions
-        ws.freeze_panes = "A2"
-        _autosize(ws, 1)
-        ws.column_dimensions["H"].width = 70  # Comments
+
+        ws.merge_cells("A1:C1")
+        ws.merge_cells("D1:F1")
+        ws["A1"], ws["D1"] = "Cmona", "Medius"
+
+        _style_header(ws, 1, 1, 3, _CM_FILL)
+        _style_header(ws, 1, 4, 6, _ME_FILL)
+        _style_header(ws, 1, 7, 9, _GREY_FILL)
+        _style_header(ws, 2, 1, len(GR_COLUMNS))
+
+        ws.auto_filter.ref = (
+            f"A2:{ws.cell(row=2, column=len(GR_COLUMNS)).column_letter}{len(gr) + 2}"
+        )
+        ws.freeze_panes = "A3"
+        _autosize(ws, 2)
+        ws.column_dimensions["I"].width = 70
+        # Wrap multi-line comments in GR Reconciliation.
+        for row in range(3, len(gr) + 3):
+            ws.cell(row=row, column=9).alignment = Alignment(
+                vertical="top",
+                wrap_text=True,
+            )
 
         # ---- Sheet 3: metrics + execution summary
         summary.to_excel(writer, sheet_name=SHEET_SUMMARY, index=False)

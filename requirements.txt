@@ -7,3 +7,4 @@ openpyxl>=3.1      # read/write .xlsx
 xlrd>=2.0.1        # read legacy .xls
 requests>=2.31
 pytest>=8.0
+truststore>=0.9

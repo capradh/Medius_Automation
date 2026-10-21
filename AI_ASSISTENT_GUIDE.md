@@ -1,4 +1,4 @@
-# AI_GUIDE.md - Oracle Automation Toolkit
+# AI_ASSISTENT_GUIDE.md - Oracle Automation Toolkit
 
 This file is written for an AI assistant (e.g. Claude in the web chat) that CANNOT see my project.
 Everything it needs to write a compatible script is in this file. Paste it at the start of a new chat.
