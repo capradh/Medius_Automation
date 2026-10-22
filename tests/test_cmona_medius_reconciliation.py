@@ -10,12 +10,18 @@ from automation.jobs.cmona_medius_reconciliation import (
     LINE_COLUMNS,
     N_CM_AMT,
     N_CM_BU,
+    N_CM_GR_CO,
+    N_CM_GR_PO,
+    N_CM_RCT,
     N_CM_ITEM,
     N_CM_PO_ID,
     N_CM_UNIT,
     N_ME_AMT,
     N_ME_CO,
     N_ME_IMPORTED_TS,
+    N_ME_GR_CO,
+    N_ME_GR_IMPORTED_TS,
+    N_ME_NOTE,
     N_ME_ITEM,
     N_ME_ORDER,
     N_ME_UNIT,
@@ -25,6 +31,7 @@ from automation.jobs.cmona_medius_reconciliation import (
     PO_COLUMNS,
     SHEET_INVOICE,
     SHEET_LINE,
+    SHEET_GR,
     SHEET_PO,
     SHEET_TRANSFER,
     aggregate_cmona_po,
@@ -35,7 +42,9 @@ from automation.jobs.cmona_medius_reconciliation import (
     matches_spec,
     FILE_SPECS,
     parse_amount_value,
+    prepare_cmona_gr,
     reconcile_po,
+    reconcile_gr,
     reconcile_po_lines,
     write_report,
 )
@@ -138,6 +147,80 @@ def test_reconcile_po_statuses_and_actions():
         r.loc["P3", "Comments"] == "[TRANSFER DETAILS] boom"
     )  # transfer sheet wins over invoice
     assert r.loc["P4", "Action Required"] == "Need Investigation"
+
+
+def test_reconciliation_output_preserves_full_medius_company_and_cleans_cmona_code(
+    tmp_path,
+):
+    cm_po = pd.DataFrame(
+        {N_CM_PO_ID: ["P1"], N_CM_BU: ["'090A"], N_CM_AMT: ["10"]}
+    )
+    me_po = pd.DataFrame(
+        {
+            N_ME_ORDER: ["P1"],
+            N_ME_CO: ["090A-Netherlands"],
+            N_ME_AMT: ["10"],
+            N_ME_IMPORTED_TS: ["2026-10-22"],
+        }
+    )
+
+    po = reconcile_po(
+        aggregate_cmona_po(cm_po),
+        aggregate_medius_po(me_po),
+        pd.Series(dtype=object),
+        pd.Series(dtype=object),
+    )
+
+    assert po.loc[0, "Company Code"] == "090A"
+    assert po.loc[0, "Purchase Order Company"] == "090A-Netherlands"
+
+    cm_gr = pd.DataFrame(
+        {
+            N_CM_RCT: ["RCT100"],
+            N_CM_GR_PO: ["P1"],
+            N_CM_GR_CO: ["'090A"],
+        }
+    )
+    me_gr = pd.DataFrame(
+        {
+            N_ME_NOTE: ["RCT100", "RCT100"],
+            N_ME_GR_CO: ["999X-Other", "090A-Netherlands"],
+            N_ME_GR_IMPORTED_TS: ["2026-10-21", "2026-10-22"],
+        }
+    )
+
+    gr = reconcile_gr(
+        prepare_cmona_gr(cm_gr),
+        me_gr,
+    )
+
+    assert GR_COLUMNS[2] == "Cmona Company code"
+    assert gr.loc[0, GR_COLUMNS[2]] == "090A"
+    assert gr.loc[0, "Medius Company Code"] == "090A-Netherlands"
+
+    report_path = tmp_path / "company_codes.xlsx"
+    write_report(
+        report_path,
+        po,
+        pd.DataFrame(columns=LINE_COLUMNS),
+        gr,
+        pd.DataFrame(columns=["Metric", "Value"]),
+        pd.DataFrame(columns=["Execution Summary", "Value"]),
+    )
+    workbook = load_workbook(report_path, read_only=True)
+    po_sheet = workbook[SHEET_PO]
+    po_headers = next(po_sheet.iter_rows(min_row=2, max_row=2, values_only=True))
+    po_values = next(po_sheet.iter_rows(min_row=3, max_row=3, values_only=True))
+    gr_sheet = workbook[SHEET_GR]
+    gr_headers = next(gr_sheet.iter_rows(min_row=2, max_row=2, values_only=True))
+    gr_values = next(gr_sheet.iter_rows(min_row=3, max_row=3, values_only=True))
+
+    assert po_values[po_headers.index("Company Code")] == "090A"
+    assert po_values[po_headers.index("Purchase Order Company")] == "090A-Netherlands"
+    assert gr_headers[2] == "Cmona Company code"
+    assert gr_values[2] == "090A"
+    assert gr_values[gr_headers.index("Medius Company Code")] == "090A-Netherlands"
+    workbook.close()
 
 
 def test_amount_mismatch():
@@ -310,6 +393,10 @@ def test_report_omits_requested_columns(tmp_path):
     }
 
     assert "Match score" not in po_headers
+    gr_headers = next(
+        workbook[SHEET_GR].iter_rows(min_row=2, max_row=2, values_only=True)
+    )
+    assert gr_headers[2] == "Cmona Company code"
     assert not removed_line_columns.intersection(line_headers)
     assert "Match score" not in line_headers
     assert "Comments" in line_headers

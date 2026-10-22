@@ -152,7 +152,7 @@ LINE_COLUMNS = [
 GR_COLUMNS = [
     "Cmona [RCT] Receipt Id",
     "Cmona [PO-P&I] PO Id",
-    "Cmona [PO-P&I]Purchasing Company (Purchase Organization Id)",
+    "Cmona Company code",
     "Medius Delivery Note (Extracted Text)",
     "Medius Company Code",
     "Purchase Order: Imported Timestamp",
@@ -621,7 +621,9 @@ def aggregate_cmona_po(df: pd.DataFrame) -> pd.DataFrame:
         {
             "key": normalize_id(cmona_ids),
             "cmona_id": cmona_ids,
-            "cmona_company": df[N_CM_BU].mask(df[N_CM_BU] == NA),
+            "cmona_company": df[N_CM_BU]
+            .str.replace("'", "", regex=False)
+            .mask(df[N_CM_BU] == NA),
             "cmona_amount": parse_amount(df[N_CM_AMT], "CMONA PO amount"),
         }
     )
@@ -648,7 +650,7 @@ def aggregate_medius_po(df: pd.DataFrame) -> pd.DataFrame:
         {
             "key": normalize_id(medius_ids),
             "medius_id": medius_ids,
-            "medius_company": company_prefix(df[N_ME_CO]).mask(lambda s: s == NA),
+            "medius_company": df[N_ME_CO],
             "medius_amount": parse_amount(df[N_ME_AMT], "Medius Ordered Amount"),
             "medius_imported_timestamp": df[N_ME_IMPORTED_TS],
         }
@@ -1065,7 +1067,7 @@ def prepare_cmona_gr(df: pd.DataFrame) -> pd.DataFrame:
             "key": normalize_id(df[N_CM_RCT]),
             "receipt": df[N_CM_RCT],
             "po": po_without_suffix(df[N_CM_GR_PO]),
-            "company": df[N_CM_GR_CO],
+            "company": df[N_CM_GR_CO].str.replace("'", "", regex=False),
         }
     )
     work = work.loc[work["key"] != NA].drop_duplicates()
@@ -1126,14 +1128,16 @@ def reconcile_gr(
     pairs = pd.DataFrame(
         {
             "note": me_gr[N_ME_NOTE],
-            "company": company_prefix(me_gr[N_ME_GR_CO]),
+            "company_code": company_prefix(me_gr[N_ME_GR_CO]),
+            "company": me_gr[N_ME_GR_CO],
             "imported_timestamp": me_gr[N_ME_GR_IMPORTED_TS],
         }
     ).drop_duplicates()
     pairs = pairs.loc[pairs["note"] != NA]
-    rows: list[tuple[str, str, str, str, str]] = []
-    for note, company, imported_timestamp in zip(
+    rows: list[tuple[str, str, str, str, str, str]] = []
+    for note, company_code, company, imported_timestamp in zip(
         pairs["note"].to_numpy(),
+        pairs["company_code"].to_numpy(),
         pairs["company"].to_numpy(),
         pairs["imported_timestamp"].to_numpy(),
     ):
@@ -1142,6 +1146,7 @@ def reconcile_gr(
                 (
                     key,
                     extracted,
+                    company_code,
                     company,
                     note,
                     imported_timestamp,
@@ -1153,6 +1158,7 @@ def reconcile_gr(
         columns=[
             "key",
             "extracted",
+            "medius_company_code",
             "medius_company",
             "note",
             "medius_imported_timestamp",
@@ -1164,7 +1170,7 @@ def reconcile_gr(
     ]
     m["company_ok"] = [
         isinstance(mc, str) and mc.upper() in s
-        for mc, s in zip(m["medius_company"], cm_companies)
+        for mc, s in zip(m["medius_company_code"], cm_companies)
     ]
     m = (
         m.sort_values(
