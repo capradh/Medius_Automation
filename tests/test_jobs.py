@@ -9,6 +9,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import run_job  # noqa: E402
 from automation.jobs.db_to_excel import validate_read_only  # noqa: E402
+from automation.jobs import lara_medius_reconciliation  # noqa: E402
 
 
 @pytest.fixture
@@ -50,6 +51,20 @@ def test_missing_file_fails_cleanly(isolated):
 def test_unknown_job_and_db_required(isolated, capsys):
     assert run_job.main(["does_not_exist"]) == 2
     assert run_job.main(["daily_report"]) == 2  # no --db and no DEFAULT_DB
+
+
+def test_fixed_database_job_does_not_expose_db_argument():
+    parser = run_job.build_parser(lara_medius_reconciliation)
+    parsed = parser.parse_args(["lara_medius_reconciliation"])
+    option_strings = {
+        option
+        for action in parser._actions
+        for option in action.option_strings
+    }
+
+    assert "--db" not in option_strings
+    assert not hasattr(parsed, "db")
+    assert lara_medius_reconciliation.DATABASE_NAME == "LARA"
 
 
 def test_notify_sends_email_with_attachment(isolated, monkeypatch):

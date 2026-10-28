@@ -9,12 +9,8 @@ with latest_payload as (
                         trepa_uid desc
           ) as rn
      from sce.trepa_events_payload
-    where created_month >= trunc(
-         sysdate - :lookback_days,
-         'MM'
-      )
-      and created_date >= sysdate - :lookback_days
-      and trepa_payload is json
+    where created_date >= trunc(sysdate) - :lookback_days
+      and created_date < trunc(sysdate)
 )
 select p.trepa_uid,
        p.trepa_to_number,
@@ -25,22 +21,19 @@ select p.trepa_uid,
        j.containernumber,
        p.created_date
   from latest_payload p
-  left outer join
-   json_table ( p.trepa_payload,'$'
+outer apply
+   json_table ( p.trepa_payload,'$.lines[*]'
       columns (
-         nested path '$.lines[*]'
-            columns (
-               chargeCode varchar2 ( 150 ) path '$.chargeCode' null on error,
-               lineAmount number path '$.lineAmount' null on error,
-               selfBillingReference varchar2 ( 150 ) path '$.selfBillingReference' null on error,
-               blNumber varchar2 ( 150 ) path '$.blNumber' null on error,
-               containerNumber varchar2 ( 150 ) path '$.containerNumber' null on error
-            )
+         chargecode varchar2 ( 150 ) path '$.chargeCode',
+         lineamount number path '$.lineAmount',
+         selfbillingreference varchar2 ( 150 ) path '$.selfBillingReference',
+         blnumber varchar2 ( 150 ) path '$.blNumber',
+         containernumber varchar2 ( 150 ) path '$.containerNumber'
       )
    )
 j
-on 1 = 1
  where p.rn = 1
+   and p.trepa_to_number = '60021601901'
  order by p.trepa_to_number,
           j.chargecode,
           j.containernumber,

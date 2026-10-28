@@ -43,7 +43,7 @@ def collect_input_files(paths: Iterable[str | Path]) -> list[Path]:
     return unique
 
 
-def pick_files() -> list[Path]:
+def pick_files(title: str = "Select data files") -> list[Path]:
     """Open a Windows file-picker window (tkinter ships with the python.org installer)."""
     try:
         import tkinter
@@ -54,7 +54,7 @@ def pick_files() -> list[Path]:
     root.withdraw()
     root.attributes("-topmost", True)
     chosen = filedialog.askopenfilenames(
-        title="Select data files",
+        title=title,
         filetypes=[("Data files", "*.csv *.tsv *.xls *.xlsx *.json *.jsonl"), ("All files", "*.*")],
     )
     root.destroy()

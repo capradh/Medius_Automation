@@ -1,8 +1,8 @@
 r"""Reconcile a Medius LARATO Excel report with read-only LARA Oracle data.
 
-.\.venv\Scripts\python.exe scripts\run_job.py lara_medius_reconciliation --db LARA
-.\.venv\Scripts\python.exe scripts\run_job.py lara_medius_reconciliation --db LARA --pick
-.\.venv\Scripts\python.exe scripts\run_job.py lara_medius_reconciliation --db LARA --medius-file input\report.xlsx
+.\.venv\Scripts\python.exe scripts\run_job.py lara_medius_reconciliation
+.\.venv\Scripts\python.exe scripts\run_job.py lara_medius_reconciliation --pick
+.\.venv\Scripts\python.exe scripts\run_job.py lara_medius_reconciliation --medius-file input\report.xlsx --lif2-file input\Lif2.xlsx
 """
 
 from __future__ import annotations
@@ -30,7 +30,8 @@ from ..processing import clean_column_name
 from ..results import JobResult
 
 log = logging.getLogger(__name__)
-REQUIRES_DB = True
+DATABASE_NAME = "LARA"
+REQUIRES_DB = False
 WRITES = False
 EXCEL_EXTENSIONS = {".xls", ".xlsx", ".xlsm"}
 EXCEL_MAX_ROWS = 1_048_576
@@ -80,14 +81,21 @@ LINE_COLUMNS = [
     "containerNumber",
     "created_date",
     *MEDIUS_LABELS[:3],
-    "Medius Container Number",
+    "Medius selfBillingReference",
+    "Medius blNumber",
+    "Medius containerNumber",
     "Item Line Status",
     "Comments",
 ]
+REFERENCE_FIELDS = ("selfBillingReference", "blNumber", "containerNumber")
 
 
 def add_arguments(p: Any) -> None:
     p.add_argument("--medius-file")
+    p.add_argument(
+        "--lif2-file",
+        help="Optional Lif2 workbook path for PO error messages in Comments",
+    )
     p.add_argument("--pick", action="store_true")
     p.add_argument("--input-pattern", default="*medius*larato*")
     p.add_argument("--lookback-days", type=int, default=2)
@@ -234,10 +242,8 @@ def clean_medius_raw(raw: pd.DataFrame) -> pd.DataFrame:
         df[f"_{col}_key"] = df[col].map(
             lambda x: normalize_identifier(x, casefold=True)
         )
+    df["_additional_numbers"] = df[M_ADDITIONAL].map(parse_additional_numbers)
     df["_container"] = df[M_ADDITIONAL].map(extract_container_number)
-    df["_container_key"] = df["_container"].map(
-        lambda x: normalize_identifier(x, casefold=True)
-    )
     original_amount = df[M_AMOUNT].copy()
     df[M_AMOUNT] = original_amount.map(parse_amount)
     df["_amount_invalid"] = original_amount.notna() & df[M_AMOUNT].isna()
@@ -282,6 +288,111 @@ def select_input_file(
     if path.suffix.casefold() not in EXCEL_EXTENSIONS:
         raise ValueError(f"Unsupported Medius extension: {path.suffix}")
     return path
+
+
+def read_lif2_errors(path: str | Path) -> dict[str, list[str]]:
+    """Load Lif2 message text from its invoice and transfer detail sheets."""
+    lif2_path = Path(path)
+    if not lif2_path.is_file():
+        raise FileNotFoundError(f"Lif2 file not found: {lif2_path}")
+    if lif2_path.suffix.casefold() not in EXCEL_EXTENSIONS:
+        raise ValueError(f"Unsupported Lif2 extension: {lif2_path.suffix}")
+
+    messages: dict[str, list[str]] = {}
+    po_columns = {
+        "po_identifier_sq",
+        "po_id",
+        "vcr_po_id",
+        "source_id",
+        "source_transaction_id",
+    }
+    try:
+        with pd.ExcelFile(lif2_path) as workbook:
+            sheets = {name.casefold(): name for name in workbook.sheet_names}
+            for expected_sheet in ("INVOICE DETAILS", "TRANSFER DETAILS"):
+                sheet = sheets.get(expected_sheet.casefold())
+                if sheet is None:
+                    raise ValueError(
+                        f"Lif2 workbook is missing sheet {expected_sheet!r}"
+                    )
+                frame = workbook.parse(sheet, dtype=object)
+                frame.columns = [clean_column_name(column) for column in frame.columns]
+                po_column = next(
+                    (column for column in frame.columns if column in po_columns),
+                    None,
+                )
+                message_column = next(
+                    (
+                        column
+                        for column in frame.columns
+                        if column in {"message_text", "message"}
+                    ),
+                    None,
+                )
+                if po_column is None or message_column is None:
+                    raise ValueError(
+                        f"Lif2 sheet {expected_sheet!r} requires a PO ID and "
+                        f"Message Text column; found {list(frame.columns)}"
+                    )
+                for po_value, message_value in zip(
+                    frame[po_column], frame[message_column]
+                ):
+                    po_key = normalize_identifier(po_value, casefold=True)
+                    message = visible_text(message_value)
+                    if pd.isna(po_key) or pd.isna(message):
+                        continue
+                    entry = f"{expected_sheet}: {message}"
+                    messages.setdefault(str(po_key), []).append(entry)
+    except (FileNotFoundError, ValueError):
+        raise
+    except Exception as exc:
+        raise ValueError(
+            f"Cannot read Lif2 workbook {lif2_path.name}: {exc}"
+        ) from exc
+
+    return {
+        po_key: list(dict.fromkeys(po_messages))
+        for po_key, po_messages in messages.items()
+    }
+
+
+def add_lif2_comments(
+    headers: pd.DataFrame,
+    lines: pd.DataFrame,
+    lif2_errors: dict[str, list[str]],
+    *,
+    lif2_supplied: bool,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Append Lif2 and reconciliation messages to unmatched PO comments."""
+    if not lif2_supplied:
+        return headers, lines
+
+    def apply(frame: pd.DataFrame, po_column: str, status_column: str) -> pd.DataFrame:
+        result = frame.copy()
+
+        def append_comments(row: pd.Series) -> str:
+            existing = visible_text(row["Comments"])
+            existing_text = "" if pd.isna(existing) else str(existing)
+            status = row[status_column]
+            matched = isinstance(status, (bool, np.bool_)) and bool(status)
+            if matched:
+                return existing_text
+            po_key = normalize_identifier(row[po_column], casefold=True)
+            lif2_text = (
+                lif2_errors.get(str(po_key), []) if pd.notna(po_key) else []
+            )
+            parts = list(lif2_text)
+            if existing_text:
+                parts.append(f"MEDIUS ERROR: {existing_text}")
+            return "\n".join(dict.fromkeys(parts))
+
+        result["Comments"] = result.apply(append_comments, axis=1)
+        return result
+
+    return (
+        apply(headers, "trepa_to_number", "PO Match Status"),
+        apply(lines, "trepa_to_number", "Item Line Status"),
+    )
 
 
 def fetch_oracle(
@@ -352,6 +463,11 @@ def prepare_oracle(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
         out[f"_{col}_key"] = out[col].map(
             lambda x: normalize_identifier(x, casefold=True)
         )
+    for col in ("selfBillingReference", "blNumber"):
+        out[col] = out[col].map(normalize_identifier)
+        out[f"_{col}_key"] = out[col].map(
+            lambda x: normalize_identifier(x, casefold=True)
+        )
     original_amount = out["lineAmount"].copy()
     out["lineAmount"] = original_amount.map(parse_amount)
     out["_amount_invalid"] = original_amount.notna() & out["lineAmount"].isna()
@@ -361,6 +477,21 @@ def prepare_oracle(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
 
 def _sum_or_nan(s: pd.Series) -> float:
     return s.sum(min_count=1)
+
+
+def parse_additional_numbers(value: Any) -> dict[str, str]:
+    """Return semicolon-delimited Medius identifiers indexed case-insensitively."""
+    text = visible_text(value)
+    if pd.isna(text):
+        return {}
+    tokens: dict[str, str] = {}
+    for part in str(text).split(";"):
+        display = normalize_identifier(part)
+        if pd.isna(display):
+            continue
+        key = normalize_identifier(display, casefold=True)
+        tokens.setdefault(key, display)
+    return tokens
 
 
 def _set_text(s: Iterable[Any]) -> str:
@@ -506,18 +637,17 @@ def reconcile_lines(
         time.monotonic() - started,
     )
 
-    def container_rank(oracle_index: int, medius_index: int) -> int:
-        oracle_container = oracle.at[oracle_index, "_containerNumber_key"]
-        medius_container = m.at[medius_index, "_container_key"]
-        if (
-            pd.notna(oracle_container)
-            and pd.notna(medius_container)
-            and oracle_container == medius_container
-        ):
-            return 0
-        if pd.isna(oracle_container) or pd.isna(medius_container):
-            return 1
-        return 2
+    def reference_keys(oracle_index: int) -> tuple[str, ...]:
+        return tuple(
+            key
+            for field in REFERENCE_FIELDS
+            if pd.notna(key := oracle.at[oracle_index, f"_{field}_key"])
+        )
+
+    def references_match(oracle_index: int, medius_index: int) -> bool:
+        expected = reference_keys(oracle_index)
+        actual = m.at[medius_index, "_additional_numbers"]
+        return all(key in actual for key in expected)
 
     assigned: dict[int, int] = {}
     for group_number, (key, oracle_indexes) in enumerate(oracle_groups.items(), 1):
@@ -537,9 +667,10 @@ def reconcile_lines(
             amount = oracle.at[oi, "lineAmount"]
             if pd.isna(amount) or not available:
                 continue
+            eligible = [mi for mi in available if references_match(oi, mi)]
             exact = [
                 mi
-                for mi in available
+                for mi in eligible
                 if pd.notna(m.at[mi, M_AMOUNT])
                 and np.isclose(amount, m.at[mi, M_AMOUNT], atol=tolerance, rtol=0)
             ]
@@ -547,7 +678,6 @@ def reconcile_lines(
                 chosen = min(
                     exact,
                     key=lambda mi: (
-                        container_rank(oi, mi),
                         abs(amount - m.at[mi, M_AMOUNT]),
                         int(m.at[mi, "_medius_id"]),
                     ),
@@ -559,13 +689,15 @@ def reconcile_lines(
             if oi in assigned or not available:
                 continue
             amount = oracle.at[oi, "lineAmount"]
+            eligible = [mi for mi in available if references_match(oi, mi)]
+            if not eligible:
+                continue
             chosen = min(
-                available,
+                eligible,
                 key=lambda mi: (
                     abs(amount - m.at[mi, M_AMOUNT])
                     if pd.notna(amount) and pd.notna(m.at[mi, M_AMOUNT])
                     else float("inf"),
-                    container_rank(oi, mi),
                     int(m.at[mi, "_medius_id"]),
                 ),
             )
@@ -589,6 +721,7 @@ def reconcile_lines(
         "PO_MISSING": "PO is missing in Medius",
         "CHARGE_MISMATCH": "Charge Code is unmatched",
         "MEDIUS_LINE_MISSING": "Medius line item is missing",
+        "REFERENCE_MISMATCH": "Medius additional numbers do not match Oracle reference values",
         "ORACLE_AMOUNT_MISSING": "Oracle line amount is missing",
         "MEDIUS_AMOUNT_MISSING": "Medius line amount is missing",
         "AMOUNT_MISMATCH": "Line Amount is unmatched",
@@ -606,33 +739,6 @@ def reconcile_lines(
                 int(m.at[mi, "_medius_id"]),
             ),
         )
-
-    def container_warning(oracle_value: Any, medius_value: Any) -> tuple[str, str]:
-        oracle_missing = pd.isna(oracle_value)
-        medius_missing = pd.isna(medius_value)
-        if oracle_missing and medius_missing:
-            return (
-                "CONTAINER_MISSING_BOTH",
-                "Container number is missing in LARA and Medius; row is ambiguous",
-            )
-        if oracle_missing:
-            return (
-                "CONTAINER_MISSING_LARA",
-                "Container number is missing in LARA; row is ambiguous",
-            )
-        if medius_missing:
-            return (
-                "CONTAINER_MISSING_MEDIUS",
-                "Container number is missing in Medius; row is ambiguous",
-            )
-        if normalize_identifier(oracle_value, casefold=True) != normalize_identifier(
-            medius_value, casefold=True
-        ):
-            return (
-                "CONTAINER_UNMATCHED",
-                "Container number is unmatched; row is ambiguous",
-            )
-        return "", ""
 
     rows: list[dict[str, Any]] = []
     ordered_oracle = oracle.sort_values("_oracle_id")
@@ -655,7 +761,12 @@ def reconcile_lines(
         elif not code_pool:
             reason = "CHARGE_MISMATCH"
         elif assigned_mi is None:
-            reason = "MEDIUS_LINE_MISSING"
+            reason = (
+                "REFERENCE_MISMATCH"
+                if reference_keys(oi)
+                and not any(references_match(oi, mi) for mi in code_pool)
+                else "MEDIUS_LINE_MISSING"
+            )
         elif pd.isna(o["lineAmount"]):
             reason = "ORACLE_AMOUNT_MISSING"
         elif pd.isna(mr[M_AMOUNT]):
@@ -664,26 +775,34 @@ def reconcile_lines(
             reason = "AMOUNT_MISMATCH"
         else:
             reason = ""
-        container_issue, container_comment = ("", "")
-        if not reason and mr is not None:
-            container_issue, container_comment = container_warning(
-                o["containerNumber"], mr["_container"]
-            )
+        matched_references = mr["_additional_numbers"] if mr is not None else {}
         row = {column: o.get(column, np.nan) for column in LINE_COLUMNS[:7]}
         row.update(
             {
                 MEDIUS_LABELS[0]: mr[M_PO] if mr is not None else np.nan,
                 MEDIUS_LABELS[1]: mr[M_ITEM] if mr is not None else np.nan,
                 MEDIUS_LABELS[2]: mr[M_AMOUNT] if mr is not None else np.nan,
-                "Medius Container Number": mr["_container"]
-                if mr is not None
+                "Medius selfBillingReference": matched_references.get(
+                    o["_selfBillingReference_key"], np.nan
+                )
+                if pd.notna(o["_selfBillingReference_key"])
+                else np.nan,
+                "Medius blNumber": matched_references.get(
+                    o["_blNumber_key"], np.nan
+                )
+                if pd.notna(o["_blNumber_key"])
+                else np.nan,
+                "Medius containerNumber": matched_references.get(
+                    o["_containerNumber_key"], np.nan
+                )
+                if pd.notna(o["_containerNumber_key"])
                 else np.nan,
                 "Item Line Status": "PENDING"
                 if reason == "PO_AWAITING_MEDIUS"
                 else not reason,
-                "Comments": comments.get(reason, "") or container_comment,
+                "Comments": comments.get(reason, ""),
                 "_reason": reason,
-                "_container_issue": container_issue,
+                "_reference_issue": reason == "REFERENCE_MISMATCH",
                 "_medius_id": int(mr["_medius_id"])
                 if assigned_mi is not None
                 else np.nan,
@@ -721,13 +840,15 @@ def build_summary(
     invalid_medius: int,
     invalid_oracle: int,
     status: str = "SUCCESS",
+    lif2_filename: str = "Not supplied",
 ) -> pd.DataFrame:
     hr = headers["_reasons"]
     lr = lines["_reason"]
-    container_issues = lines["_container_issue"]
+    reference_issues = lines["_reference_issue"]
     values = [
         ("Execution", "execution timestamp", timestamp),
         ("Execution", "Medius input filename", filename),
+        ("Execution", "Lif2 input filename", lif2_filename),
         ("Execution", "Oracle environment", environment),
         ("Execution", "lookback days", lookback_days),
         ("Execution", "amount tolerance", tolerance),
@@ -783,8 +904,8 @@ def build_summary(
         ("Line Item", "charge-code mismatches", int(lr.eq("CHARGE_MISMATCH").sum())),
         (
             "Line Item",
-            "container mismatches or missing",
-            int(container_issues.ne("").sum()),
+            "additional-number mismatches",
+            int(reference_issues.sum()),
         ),
         ("Line Item", "missing Medius lines", int(lr.eq("MEDIUS_LINE_MISSING").sum())),
         (
@@ -928,10 +1049,10 @@ def write_workbook(
             "PO Line Item Reconciliation",
             lines,
             LINE_COLUMNS,
-            [("LARATO", 1, 7), ("Medius", 8, 11), ("Reconciliation", 12, 13)],
+            [("LARATO", 1, 7), ("Medius", 8, 13), ("Reconciliation", 14, 15)],
             {3, 10},
-            12,
-            {1, 2, 4, 5, 6, 8, 9, 11},
+            14,
+            {1, 2, 4, 5, 6, 8, 9, 11, 12, 13},
         )
         log.info("workbook: creating Summary sheet")
         ws = wb.create_sheet("Summary")
@@ -994,7 +1115,7 @@ def run(args: Any) -> JobResult:
     sql_path = Path(__file__).parents[3] / "sql" / "lara_medius_reconciliation.sql"
     sql = sql_path.read_text(encoding="utf-8")
     raw = fetch_oracle(
-        args.db, sql, args.lookback_days, args.max_rows, args.db_timeout_seconds
+        DATABASE_NAME, sql, args.lookback_days, args.max_rows, args.db_timeout_seconds
     )
     log.info("Oracle preparation started")
     phase_started = time.monotonic()
@@ -1016,11 +1137,23 @@ def run(args: Any) -> JobResult:
     )
     log.info("PO line item reconciliation started: %d Oracle lines", len(oracle))
     lines = reconcile_lines(oracle, medius, args.tolerance, as_of=now)
+    lif2_path = getattr(args, "lif2_file", None)
+    lif2_errors = read_lif2_errors(lif2_path) if lif2_path else {}
+    headers, lines = add_lif2_comments(
+        headers,
+        lines,
+        lif2_errors,
+        lif2_supplied=lif2_path is not None,
+    )
+    log.info(
+        "Lif2 comments loaded: %d PO IDs with messages",
+        len(lif2_errors),
+    )
     log.info("summary creation started")
     phase_started = time.monotonic()
     oracle_pos = set(oracle["_trepa_to_number_key"].dropna())
     medius_pos = set(medius[f"_{M_PO}_key"].dropna())
-    db = get_database(args.db)
+    db = get_database(DATABASE_NAME)
     summary = build_summary(
         headers,
         lines,
@@ -1035,6 +1168,7 @@ def run(args: Any) -> JobResult:
         medius_only=len(medius_pos - oracle_pos),
         invalid_medius=invalid_medius,
         invalid_oracle=invalid_oracle,
+        lif2_filename=Path(lif2_path).name if lif2_path else "Not supplied",
     )
     log.info("summary creation complete in %.2fs", time.monotonic() - phase_started)
     out = (

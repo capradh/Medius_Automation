@@ -68,15 +68,93 @@ def test_created_before_today_missing_po_is_false():
     assert line["Comments"] == "PO is missing in Medius"
 def test_po_amount_mismatch(): assert "PO Amount" in job.reconcile_headers(oracle(),medius([["PO1","C1",12,"CONT1","2024-01-01","Yes"]]),.01).iloc[0].Comments
 def test_charge_set_mismatch(): assert "Charge Code" in job.reconcile_headers(oracle(),medius([["PO1","C2",10,"CONT1","2024-01-01","Yes"]]),.01).iloc[0].Comments
-def test_container_mismatch_is_warning_not_failure():
+def test_additional_number_mismatch_fails_line_match():
     row = job.reconcile_lines(
         oracle(), medius([["PO1","C1",10,"OTHER","2024-01-01","Yes"]]), .01
     ).iloc[0]
+    assert not bool(row["Item Line Status"])
+    assert row["_reason"] == "REFERENCE_MISMATCH"
+    assert bool(row["_reference_issue"])
+    assert "additional numbers" in row["Comments"]
+    assert pd.isna(row["Medius containerNumber"])
+
+
+def test_additional_numbers_match_oracle_fields_unordered_and_independently():
+    o = oracle(
+        [[
+            1,
+            "PO1",
+            "1",
+            "C1",
+            "EUR",
+            10,
+            "ANT2004587",
+            "SANT2611466",
+            "CMAU2405511",
+            datetime(2024, 1, 1),
+        ]]
+    )
+    m = medius(
+        [["PO1", "C1", 10, " CMAU2405511 ; SANT2611466 ; ANT2004587 ", "2024-01-01", "Yes"]]
+    )
+
+    row = job.reconcile_lines(o, m, .01).iloc[0]
+
     assert bool(row["Item Line Status"])
-    assert row["_reason"] == ""
-    assert row["_container_issue"] == "CONTAINER_UNMATCHED"
-    assert row["Comments"] == "Container number is unmatched; row is ambiguous"
-    assert row["Medius Container Number"] == "OTHER"
+    assert row["Medius selfBillingReference"] == "ANT2004587"
+    assert row["Medius blNumber"] == "SANT2611466"
+    assert row["Medius containerNumber"] == "CMAU2405511"
+
+
+def test_missing_additional_number_match_is_na():
+    o = oracle(
+        [[
+            1,
+            "PO1",
+            "1",
+            "C1",
+            "EUR",
+            10,
+            "ANT2004587",
+            None,
+            "CMAU2405511",
+            datetime(2024, 1, 1),
+        ]]
+    )
+    m = medius([["PO1", "C1", 10, "CMAU2405511", "2024-01-01", "Yes"]])
+
+    row = job.reconcile_lines(o, m, .01).iloc[0]
+
+    assert not bool(row["Item Line Status"])
+    assert row["_reason"] == "REFERENCE_MISMATCH"
+    assert pd.isna(row["Medius selfBillingReference"])
+    assert pd.isna(row["Medius blNumber"])
+    assert row["Medius containerNumber"] == "CMAU2405511"
+
+
+def test_one_or_two_available_oracle_references_can_match():
+    o = oracle(
+        [[
+            1,
+            "PO1",
+            "1",
+            "C1",
+            "EUR",
+            10,
+            "ANT2004587",
+            None,
+            "CMAU2405511",
+            datetime(2024, 1, 1),
+        ]]
+    )
+    m = medius([["PO1", "C1", 10, "CMAU2405511; ANT2004587", "2024-01-01", "Yes"]])
+
+    row = job.reconcile_lines(o, m, .01).iloc[0]
+
+    assert bool(row["Item Line Status"])
+    assert row["Medius selfBillingReference"] == "ANT2004587"
+    assert pd.isna(row["Medius blNumber"])
+    assert row["Medius containerNumber"] == "CMAU2405511"
 def test_line_amount_mismatch(): assert job.reconcile_lines(oracle(),medius([["PO1","C1",20,"CONT1","2024-01-01","Yes"]]),.01).iloc[0]._reason == "AMOUNT_MISMATCH"
 def test_tolerance_match(): assert bool(job.reconcile_lines(oracle(),medius([["PO1","C1",10.009,"CONT1","2024-01-01","Yes"]]),.01).iloc[0]["Item Line Status"])
 def test_duplicate_order_independent_and_no_reuse():
@@ -135,7 +213,8 @@ def test_exact_output_columns():
         "trepa_to_number","chargeCode","lineAmount","selfBillingReference",
         "blNumber","containerNumber","created_date",
         "Purchase Order: Order Identifier 2","Item: Number",
-        "Purchase Order Line: Confirmed Amount","Medius Container Number",
+        "Purchase Order Line: Confirmed Amount","Medius selfBillingReference",
+        "Medius blNumber","Medius containerNumber",
         "Item Line Status","Comments",
     ]
 def test_workbook_features(tmp_path):
@@ -144,6 +223,10 @@ def test_workbook_features(tmp_path):
     p=job.write_workbook(tmp_path/"x.xlsx",h,l,s); wb=load_workbook(p)
     assert wb.sheetnames==["PO Header Reconciliation","PO Line Item Reconciliation","Summary"]
     ws=wb[wb.sheetnames[0]]; assert ws.freeze_panes=="A3" and ws.auto_filter.ref and "A1:D1" in {str(x) for x in ws.merged_cells.ranges}
+    line_ws=wb["PO Line Item Reconciliation"]
+    assert "H1:M1" in {str(x) for x in line_ws.merged_cells.ranges}
+    assert "N1:O1" in {str(x) for x in line_ws.merged_cells.ranges}
+    assert [line_ws.cell(2, col).value for col in range(1, 16)] == job.LINE_COLUMNS
 def test_summary_metrics():
     h=job.reconcile_headers(oracle(),medius(),.01); l=job.reconcile_lines(oracle(),medius(),.01)
     s=job.build_summary(h,l,timestamp=datetime.now(),filename="x",environment="T",lookback_days=1,tolerance=.01,oracle_rows=1,medius_rows=1,duration=1,medius_only=0,invalid_medius=0,invalid_oracle=0)
@@ -197,6 +280,78 @@ def test_picker_on_multiple(monkeypatch,tmp_path):
 def test_add_arguments_defaults():
     p=argparse.ArgumentParser(); job.add_arguments(p); a=p.parse_args([])
     assert a.lookback_days==1 and a.max_rows==1_000_000 and a.tolerance==.01
+    assert a.lif2_file is None
+
+
+def test_read_lif2_errors_reads_both_sheets_and_prefixes_messages(tmp_path):
+    lif2_path = tmp_path / "Lif2.xlsx"
+    with pd.ExcelWriter(lif2_path) as writer:
+        pd.DataFrame(
+            {"Source ID": ["PO1"], "Message Text": ["Invoice issue"]}
+        ).to_excel(writer, sheet_name="INVOICE DETAILS", index=False)
+        pd.DataFrame(
+            {"Source Transaction ID": ["PO1"], "Message Text": ["Transfer issue"]}
+        ).to_excel(writer, sheet_name="TRANSFER DETAILS", index=False)
+
+    messages = job.read_lif2_errors(lif2_path)
+
+    assert messages["po1"] == [
+        "INVOICE DETAILS: Invoice issue",
+        "TRANSFER DETAILS: Transfer issue",
+    ]
+
+
+def test_lif2_comments_add_sheet_errors_and_medius_error_only_for_unmatched():
+    headers = pd.DataFrame(
+        [
+            {"trepa_to_number": "PO1", "PO Match Status": False, "Comments": "PO Amount is unmatched"},
+            {"trepa_to_number": "PO2", "PO Match Status": True, "Comments": ""},
+        ]
+    )
+    lines = pd.DataFrame(
+        [
+            {"trepa_to_number": "PO1", "Item Line Status": False, "Comments": "Line Amount is unmatched"},
+            {"trepa_to_number": "PO2", "Item Line Status": True, "Comments": ""},
+        ]
+    )
+    errors = {
+        "po1": [
+            "INVOICE DETAILS: Invoice issue",
+            "TRANSFER DETAILS: Transfer issue",
+        ]
+    }
+
+    updated_headers, updated_lines = job.add_lif2_comments(
+        headers, lines, errors, lif2_supplied=True
+    )
+
+    expected_prefix = (
+        "INVOICE DETAILS: Invoice issue\n"
+        "TRANSFER DETAILS: Transfer issue\n"
+        "MEDIUS ERROR: "
+    )
+    assert updated_headers.iloc[0]["Comments"] == expected_prefix + "PO Amount is unmatched"
+    assert updated_lines.iloc[0]["Comments"] == expected_prefix + "Line Amount is unmatched"
+    assert updated_headers.iloc[1]["Comments"] == ""
+    assert updated_lines.iloc[1]["Comments"] == ""
+
+
+def test_lif2_comments_leave_existing_behavior_when_not_supplied():
+    headers = pd.DataFrame(
+        [{"trepa_to_number": "PO1", "PO Match Status": False, "Comments": "PO is missing"}]
+    )
+    lines = pd.DataFrame(
+        [{"trepa_to_number": "PO1", "Item Line Status": False, "Comments": "Line is missing"}]
+    )
+
+    updated_headers, updated_lines = job.add_lif2_comments(
+        headers, lines, {}, lif2_supplied=False
+    )
+
+    assert updated_headers.iloc[0]["Comments"] == "PO is missing"
+    assert updated_lines.iloc[0]["Comments"] == "Line is missing"
+
+
 def test_mocked_run(monkeypatch,tmp_path):
     source=tmp_path/"Medius_LARATO.xlsx"; source.touch(); captured={}
     monkeypatch.setattr(job,"get_settings",lambda:SimpleNamespace(input_dir=tmp_path,output_dir=tmp_path))
@@ -204,6 +359,7 @@ def test_mocked_run(monkeypatch,tmp_path):
     def fetch(db,sql,lookback,max_rows,timeout): captured.update(db=db,sql=sql,lookback=lookback,max_rows=max_rows); return oracle().drop(columns=[c for c in oracle().columns if c.startswith("_")])
     monkeypatch.setattr(job,"fetch_oracle",fetch); monkeypatch.setattr(job,"get_database",lambda _:SimpleNamespace(env="TEST"))
     monkeypatch.setattr(job,"write_workbook",lambda p,*a:p)
-    args=SimpleNamespace(tolerance=.01,lookback_days=1,max_rows=10,db_timeout_seconds=5,medius_file=str(source),input_pattern="*",pick=False,sheet=0,db="LARA")
+    args=SimpleNamespace(tolerance=.01,lookback_days=1,max_rows=10,db_timeout_seconds=5,medius_file=str(source),input_pattern="*",pick=False,sheet=0)
     result=job.run(args)
+    assert captured["db"] == job.DATABASE_NAME
     assert captured["lookback"]==1 and captured["max_rows"]==10 and result.files[0].name.startswith("LARA_MEDIUS_Reconciliation_Report_") and result.summary.endswith("SUCCESS")

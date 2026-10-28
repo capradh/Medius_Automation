@@ -3,7 +3,8 @@ r"""Run an automation job.
     python scripts\run_job.py <job> [options]
     python scripts\run_job.py <job> --help       (shows that job's options)
 
-Common options: --db NAME  --execute  --notify  --email-to a@x.com,b@x.com  --no-attach
+Common options: --execute  --notify  --email-to a@x.com,b@x.com  --no-attach
+Jobs without a configured database also accept --db NAME.
 """
 import argparse
 import importlib
@@ -32,7 +33,8 @@ def build_parser(module=None) -> argparse.ArgumentParser:
     )
     p.add_argument("job", help="job name: " + ", ".join(available_jobs()))
     c = p.add_argument_group("common options")
-    c.add_argument("--db", help="database name, e.g. corsair (falls back to DEFAULT_DB)")
+    if module is None or not getattr(module, "DATABASE_NAME", None):
+        c.add_argument("--db", help="database name, e.g. corsair (falls back to DEFAULT_DB)")
     c.add_argument("--execute", action="store_true", help="commit changes (default is dry run / rollback)")
     c.add_argument("--notify", action="store_true", help="email the result (and failures) when finished")
     c.add_argument("--email-to", help="recipients (comma/semicolon separated); default EMAIL_TO from .env")
@@ -66,8 +68,9 @@ def main(argv=None) -> int:
     log = logging.getLogger("run_job")
 
     cfg = None
-    if getattr(module, "REQUIRES_DB", False) or args.db:
-        name = args.db or get_settings().default_db
+    fixed_database = getattr(module, "DATABASE_NAME", None)
+    if fixed_database or getattr(module, "REQUIRES_DB", False) or getattr(args, "db", None):
+        name = fixed_database or args.db or get_settings().default_db
         if not name:
             print("This job needs a database. Use --db <name> or set DEFAULT_DB in .env")
             return 2
