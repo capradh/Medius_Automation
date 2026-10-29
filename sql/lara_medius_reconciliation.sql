@@ -33,7 +33,6 @@ outer apply
    )
 j
  where p.rn = 1
-   and p.trepa_to_number = '60021601901'
  order by p.trepa_to_number,
           j.chargecode,
           j.containernumber,
