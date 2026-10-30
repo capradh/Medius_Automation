@@ -249,6 +249,68 @@ def test_po_amounts_are_grouped_and_statuses_are_boolean():
     assert "MEDIUS ERROR: PO Amount is unmatched" in report.iloc[0]["Comments"]
 
 
+def test_decimal_line_difference_uses_oracle_amount_without_rounding():
+    stamp = datetime(2026, 10, 26, 12, 0)
+    result, _ = job.reconcile(
+        oracle(
+            [
+                ["PO1", "C1", 15327796.5, stamp],
+                ["PO2", "C1", 8441032.2, stamp],
+            ]
+        ),
+        medius(
+            [
+                ["X;PO1;Z", "C1", 15327797],
+                ["X;PO2;Z", "C1", 8441032],
+            ]
+        ),
+        0.01,
+    )
+
+    assert result["po_amount_match"].all()
+    assert result["line_amount_match"].all()
+    report = job.presentation(result)
+    assert report["PO Header Amount"].tolist() == [15327796.5, 8441032.2]
+    assert report["Medius PO Amount"].tolist() == [15327796.5, 8441032.2]
+    assert report["PO Line Amount"].tolist() == [15327796.5, 8441032.2]
+    assert report["Medius PO Line Amount"].tolist() == [15327796.5, 8441032.2]
+
+
+def test_one_unit_difference_remains_a_mismatch():
+    stamp = datetime(2026, 10, 26, 12, 0)
+    result, _ = job.reconcile(
+        oracle([["PO1", "C1", 100, stamp]]),
+        medius([["X;PO1;Z", "C1", 101]]),
+        0.01,
+    )
+
+    assert not result["po_amount_match"].any()
+    assert not result["line_amount_match"].any()
+
+
+def test_po_headers_sum_adjusted_line_amounts_without_rounding():
+    stamp = datetime(2026, 10, 26, 12, 0)
+    result, _ = job.reconcile(
+        oracle(
+            [
+                ["PO1", "C1", 123, stamp],
+                ["PO1", "C2", 50.25, stamp],
+            ]
+        ),
+        medius(
+            [
+                ["X;PO1;Z", "C1", 122.9],
+                ["X;PO1;Z", "C2", 50.25],
+            ]
+        ),
+        0.01,
+    )
+
+    assert result["oracle_po_amount"].tolist() == [173.25, 173.25]
+    assert result["medius_po_amount"].tolist() == [173.25, 173.25]
+    assert result["line_amount_match"].all()
+
+
 def test_workbook_has_one_reconciliation_sheet_and_summary(tmp_path):
     row = {column: "" for column in job.OUTPUT_COLUMNS}
     row.update(

@@ -375,14 +375,34 @@ def reconcile(
         for key in merged["_charge_group_key"]
     ]
 
+    line_difference = (
+        merged["oracle_charge_amount"] - merged["medius_line_amount"]
+    ).abs()
+    line_values_present = (
+        merged["oracle_charge_amount"].notna()
+        & merged["medius_line_amount"].notna()
+    )
+    line_amount_match = line_values_present & (line_difference < 1)
+    merged["medius_line_amount"] = merged["medius_line_amount"].where(
+        ~line_amount_match,
+        merged["oracle_charge_amount"],
+    )
+
     oracle_po = (
-        oracle.groupby("_po_key", dropna=False)["total_line_amount"]
+        oracle_charge_amounts.groupby(level=0, dropna=False)
         .sum(min_count=1)
         .to_dict()
     )
+    adjusted_medius_charge_amounts = medius_charge_amounts.copy()
+    for key, value in (
+        merged.drop_duplicates("_charge_group_key")
+        .set_index("_charge_group_key")["medius_line_amount"]
+        .items()
+    ):
+        if key in adjusted_medius_charge_amounts.index:
+            adjusted_medius_charge_amounts.loc[key] = value
     medius_po = (
-        medius.dropna(subset=["_po_key"])
-        .groupby("_po_key")["ordered_amount"]
+        adjusted_medius_charge_amounts.groupby(level=0, dropna=False)
         .sum(min_count=1)
         .to_dict()
     )
@@ -398,9 +418,7 @@ def reconcile(
     merged["po_amount_match"] = amounts_match(
         merged["oracle_po_amount"], merged["medius_po_amount"], tolerance
     )
-    merged["line_amount_match"] = amounts_match(
-        merged["oracle_charge_amount"], merged["medius_line_amount"], tolerance
-    )
+    merged["line_amount_match"] = line_amount_match
     codes: list[tuple[str, ...]] = []
     for _, row in merged.iterrows():
         reasons: list[str] = []

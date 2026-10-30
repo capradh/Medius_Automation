@@ -1,4 +1,12 @@
-WITH po_lines AS (
+WITH boundaries AS (
+    SELECT TRUNC(SYSDATE) + 22 / 24
+           - CASE
+                WHEN SYSDATE < TRUNC(SYSDATE) + 22 / 24 THEN 1
+                ELSE 0
+             END AS end_date
+    FROM dual
+),
+po_lines AS (
     SELECT
         p.po_identifier_sq,
         p.call_id,
@@ -9,6 +17,7 @@ WITH po_lines AS (
         j.line_amount,
         j.line_ordinal
     FROM crac.vcr_po_identifiers p
+    CROSS JOIN boundaries b
     LEFT OUTER JOIN JSON_TABLE(
         CASE
             WHEN p.last_publish_payload IS JSON THEN p.last_publish_payload
@@ -22,8 +31,8 @@ WITH po_lines AS (
             charge_code   VARCHAR2(150) PATH '$.chargeCode' NULL ON ERROR
         )
     ) j ON 1 = 1
-    WHERE p.last_update_date >= TRUNC(SYSDATE) - :lookback_days
-      AND p.last_update_date < TRUNC(SYSDATE)
+    WHERE p.last_update_date >= b.end_date - :lookback_days
+      AND p.last_update_date < b.end_date
 )
 SELECT
     po_identifier_sq,

@@ -1192,7 +1192,7 @@ def run(args: Any) -> JobResult:
         raise ValueError(
             "Medius data is empty after excluding lines with confirmed amount 0 and line Active No"
         )
-    sql_path = Path(__file__).parents[3] / "sql" / "lara_medius_reconciliation_v2.sql"
+    sql_path = Path(__file__).parents[3] / "sql" / "lara_medius_reconciliation.sql"
     sql = sql_path.read_text(encoding="utf-8")
     raw = fetch_oracle(
         DATABASE_NAME, sql, args.lookback_days, args.max_rows, args.db_timeout_seconds
