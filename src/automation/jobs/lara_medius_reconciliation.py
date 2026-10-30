@@ -48,6 +48,8 @@ MEDIUS_LABELS = [
 ]
 MEDIUS_KEYS = [clean_column_name(x) for x in MEDIUS_LABELS]
 M_PO, M_ITEM, M_AMOUNT, M_ADDITIONAL, M_DATE, M_ACTIVE = MEDIUS_KEYS
+M_SUPPLIER = clean_column_name("Purchase Order: Supplier")
+M_PO_ACTIVE = clean_column_name("Purchase Order: Active")
 REQUIRED_MEDIUS_LABELS = MEDIUS_LABELS[:4]
 REQUIRED_MEDIUS_KEYS = MEDIUS_KEYS[:4]
 ORACLE_RENAME = {
@@ -61,15 +63,25 @@ ORACLE_RENAME = {
     "BLNUMBER": "blNumber",
     "CONTAINERNUMBER": "containerNumber",
     "CREATED_DATE": "created_date",
+    "HAULIER_CODE": "haulier_code",
+    "HAULIER_NAME": "haulier_name",
+    "COUNTRY_CODE": "country_code",
+    "TO_STATUS": "to_status",
 }
 HEADER_COLUMNS = [
     "trepa_to_number",
-    "chargeCode",
     "PO Amount",
     "created_date",
-    *MEDIUS_LABELS[:2],
+    "haulier_code",
+    "haulier_name",
+    "country_code",
+    "to_status",
+    "Purchase Order: Order Identifier 2",
+    "Purchase Order: Supplier",
+    "Purchase Order: Active",
     "Medius PO Amount",
     "PO Match Status",
+    "PO Amount Match",
     "Comments",
 ]
 LINE_COLUMNS = [
@@ -126,6 +138,14 @@ def normalize_identifier(value: Any, *, casefold: bool = False) -> Any:
     else:
         value = str(value).strip()
     return value.casefold() if casefold else value
+
+
+def extract_supplier_name(value: Any) -> Any:
+    value = visible_text(value)
+    if pd.isna(value):
+        return np.nan
+    text = str(value)
+    return text.split("-", 1)[1].strip() if "-" in text else text.strip()
 
 
 def parse_amount(value: Any) -> float:
@@ -230,7 +250,7 @@ def clean_medius_raw(raw: pd.DataFrame) -> pd.DataFrame:
         raise ValueError(
             f"Missing required Medius columns: {missing}. Detected columns: {list(df.columns)}"
         )
-    for optional in (M_DATE, M_ACTIVE):
+    for optional in (M_DATE, M_ACTIVE, M_SUPPLIER, M_PO_ACTIVE):
         if optional not in df.columns:
             df[optional] = np.nan
     df = df.map(visible_text).dropna(how="all").reset_index(drop=True)
@@ -242,6 +262,7 @@ def clean_medius_raw(raw: pd.DataFrame) -> pd.DataFrame:
         df[f"_{col}_key"] = df[col].map(
             lambda x: normalize_identifier(x, casefold=True)
         )
+    df[M_SUPPLIER] = df[M_SUPPLIER].map(extract_supplier_name)
     df["_additional_numbers"] = df[M_ADDITIONAL].map(parse_additional_numbers)
     df["_container"] = df[M_ADDITIONAL].map(extract_container_number)
     original_amount = df[M_AMOUNT].copy()
@@ -346,9 +367,7 @@ def read_lif2_errors(path: str | Path) -> dict[str, list[str]]:
     except (FileNotFoundError, ValueError):
         raise
     except Exception as exc:
-        raise ValueError(
-            f"Cannot read Lif2 workbook {lif2_path.name}: {exc}"
-        ) from exc
+        raise ValueError(f"Cannot read Lif2 workbook {lif2_path.name}: {exc}") from exc
 
     return {
         po_key: list(dict.fromkeys(po_messages))
@@ -367,7 +386,12 @@ def add_lif2_comments(
     if not lif2_supplied:
         return headers, lines
 
-    def apply(frame: pd.DataFrame, po_column: str, status_column: str) -> pd.DataFrame:
+    def apply(
+        frame: pd.DataFrame,
+        po_column: str,
+        status_column: str,
+        include_lif2: bool,
+    ) -> pd.DataFrame:
         result = frame.copy()
 
         def append_comments(row: pd.Series) -> str:
@@ -379,7 +403,9 @@ def add_lif2_comments(
                 return existing_text
             po_key = normalize_identifier(row[po_column], casefold=True)
             lif2_text = (
-                lif2_errors.get(str(po_key), []) if pd.notna(po_key) else []
+                (lif2_errors.get(str(po_key), []) if pd.notna(po_key) else [])
+                if include_lif2
+                else []
             )
             parts = list(lif2_text)
             if existing_text:
@@ -390,8 +416,8 @@ def add_lif2_comments(
         return result
 
     return (
-        apply(headers, "trepa_to_number", "PO Match Status"),
-        apply(lines, "trepa_to_number", "Item Line Status"),
+        apply(headers, "trepa_to_number", "PO Match Status", True),
+        apply(lines, "trepa_to_number", "Item Line Status", False),
     )
 
 
@@ -457,13 +483,23 @@ def prepare_oracle(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
         raise ValueError(
             f"Oracle result missing columns {missing}; detected {list(out.columns)}"
         )
+    for optional in ("haulier_code", "haulier_name", "country_code", "to_status"):
+        if optional not in out.columns:
+            out[optional] = np.nan
     out["_oracle_id"] = np.arange(len(out), dtype=np.int64)
     for col in ("trepa_to_number", "chargeCode", "containerNumber"):
         out[col] = out[col].map(normalize_identifier)
         out[f"_{col}_key"] = out[col].map(
             lambda x: normalize_identifier(x, casefold=True)
         )
-    for col in ("selfBillingReference", "blNumber"):
+    for col in (
+        "selfBillingReference",
+        "blNumber",
+        "haulier_code",
+        "haulier_name",
+        "country_code",
+        "to_status",
+    ):
         out[col] = out[col].map(normalize_identifier)
         out[f"_{col}_key"] = out[col].map(
             lambda x: normalize_identifier(x, casefold=True)
@@ -523,21 +559,24 @@ def reconcile_headers(
         oracle.groupby("_trepa_to_number_key", dropna=False, sort=True)
         .agg(
             trepa_to_number=("trepa_to_number", "first"),
-            chargeCode=("chargeCode", _set_text),
             **{
                 "PO Amount": ("lineAmount", _sum_or_nan),
                 "created_date": ("created_date", "max"),
+                "haulier_code": ("haulier_code", "first"),
+                "haulier_name": ("haulier_name", "first"),
+                "country_code": ("country_code", "first"),
+                "to_status": ("to_status", "first"),
             },
         )
         .reset_index()
     )
-    eligible_medius = _eligible_medius(medius)
     mg = (
-        eligible_medius.groupby(f"_{M_PO}_key", dropna=False, sort=True)
+        medius.groupby(f"_{M_PO}_key", dropna=False, sort=True)
         .agg(
             **{
                 MEDIUS_LABELS[0]: (M_PO, "first"),
-                MEDIUS_LABELS[1]: (M_ITEM, _set_text),
+                "Purchase Order: Supplier": (M_SUPPLIER, "first"),
+                "Purchase Order: Active": (M_PO_ACTIVE, "first"),
                 "Medius PO Amount": (M_AMOUNT, _sum_or_nan),
             }
         )
@@ -569,12 +608,6 @@ def reconcile_headers(
             )
         ):
             result.append("AMOUNT_MISMATCH")
-        if {x.casefold() for x in str(r["chargeCode"]).split(";") if x} != {
-            x.casefold()
-            for x in str(r[MEDIUS_LABELS[1]]).split(";")
-            if x and x != "nan"
-        }:
-            result.append("CHARGE_MISMATCH")
         return tuple(result)
 
     out["_reasons"] = out.apply(reasons, axis=1)
@@ -584,10 +617,44 @@ def reconcile_headers(
         "AMOUNT_MISMATCH": "PO Amount is unmatched",
         "ORACLE_AMOUNT_MISSING": "Oracle PO amount is missing",
         "MEDIUS_AMOUNT_MISSING": "Medius PO amount is missing",
-        "CHARGE_MISMATCH": "Charge Code is unmatched",
+        "ZERO_AMOUNT": "PO Amount is 0.",
     }
-    out["PO Match Status"] = out["_reasons"].map(
+    out["_reasons"] = out.apply(
+        lambda row: (
+            (*row["_reasons"], "ZERO_AMOUNT")
+            if (
+                "ZERO_AMOUNT" not in row["_reasons"]
+                and row["_merge"] != "left_only"
+                and pd.notna(row["PO Amount"])
+                and pd.notna(row["Medius PO Amount"])
+                and row["PO Amount"] == 0
+                and row["Medius PO Amount"] == 0
+            )
+            else row["_reasons"]
+        ),
+        axis=1,
+    )
+    amount_reasons = {
+        "AMOUNT_MISMATCH",
+        "ORACLE_AMOUNT_MISSING",
+        "MEDIUS_AMOUNT_MISSING",
+        "ZERO_AMOUNT",
+    }
+    out["_structural_reasons"] = out["_reasons"].map(
+        lambda reasons: tuple(
+            reason for reason in reasons if reason not in amount_reasons
+        )
+    )
+    out["PO Match Status"] = out["_structural_reasons"].map(
         lambda reasons: "PENDING" if "PO_AWAITING_MEDIUS" in reasons else not reasons
+    )
+    out["PO Amount Match"] = out.apply(
+        lambda row: (
+            False
+            if row["_merge"] == "left_only"
+            else not bool(set(row["_reasons"]).intersection(amount_reasons))
+        ),
+        axis=1,
     )
     out["Comments"] = out["_reasons"].map(lambda x: "; ".join(labels[y] for y in x))
     return out
@@ -777,6 +844,14 @@ def reconcile_lines(
             reason = ""
         matched_references = mr["_additional_numbers"] if mr is not None else {}
         row = {column: o.get(column, np.nan) for column in LINE_COLUMNS[:7]}
+        ambiguous = assigned_mi is not None and len(code_pool) > 1
+        line_comment = comments.get(reason, "")
+        if ambiguous:
+            line_comment = "; ".join(
+                part
+                for part in (line_comment, "ambiguous data, found duplicate row")
+                if part
+            )
         row.update(
             {
                 MEDIUS_LABELS[0]: mr[M_PO] if mr is not None else np.nan,
@@ -787,9 +862,7 @@ def reconcile_lines(
                 )
                 if pd.notna(o["_selfBillingReference_key"])
                 else np.nan,
-                "Medius blNumber": matched_references.get(
-                    o["_blNumber_key"], np.nan
-                )
+                "Medius blNumber": matched_references.get(o["_blNumber_key"], np.nan)
                 if pd.notna(o["_blNumber_key"])
                 else np.nan,
                 "Medius containerNumber": matched_references.get(
@@ -800,7 +873,7 @@ def reconcile_lines(
                 "Item Line Status": "PENDING"
                 if reason == "PO_AWAITING_MEDIUS"
                 else not reason,
-                "Comments": comments.get(reason, ""),
+                "Comments": line_comment,
                 "_reason": reason,
                 "_reference_issue": reason == "REFERENCE_MISMATCH",
                 "_medius_id": int(mr["_medius_id"])
@@ -956,7 +1029,12 @@ def _detail_sheet(
     if len(frame) + 2 > EXCEL_MAX_ROWS:
         raise ValueError(f"Worksheet {name!r} exceeds Excel row limit")
     ws = wb.create_sheet(name)
-    colors = {"LARATO": "1F4E78", "Medius": "548235", "Reconciliation": "7030A0"}
+    colors = {
+        "LARA": "1F4E78",
+        "LARATO": "1F4E78",
+        "Medius": "548235",
+        "Reconciliation": "7030A0",
+    }
     for label, start, end in groups:
         ws.merge_cells(start_row=1, start_column=start, end_row=1, end_column=end)
         cell = ws.cell(1, start, label)
@@ -968,10 +1046,12 @@ def _detail_sheet(
         cell.font = Font(bold=True, color="FFFFFF")
         cell.fill = PatternFill("solid", fgColor="4472C4")
     for i, row in enumerate(frame[columns].itertuples(index=False, name=None), 3):
-        for j, v in enumerate(row, 1):
+        for j, (c, v) in enumerate(zip(columns, row), 1):
             cell = ws.cell(i, j, _excel_value(v))
             if j in amount_cols and isinstance(cell.value, (int, float)):
                 cell.number_format = "#,##0.00"
+            if c == "created_date" and isinstance(cell.value, datetime):
+                cell.number_format = "yyyy-mm-dd"
             if j in text_cols:
                 cell.number_format = "@"
         written = i - 2
@@ -1036,10 +1116,10 @@ def write_workbook(
             "PO Header Reconciliation",
             headers,
             HEADER_COLUMNS,
-            [("LARATO", 1, 4), ("Medius", 5, 7), ("Reconciliation", 8, 9)],
-            {3, 7},
-            8,
-            {1, 2, 5, 6},
+            [("LARA", 1, 7), ("Medius", 8, 11), ("Reconciliation", 12, 14)],
+            {2, 11},
+            12,
+            {1, 4, 5, 6, 7, 8, 9, 10},
         )
         log.info(
             "workbook: creating PO Line Item Reconciliation sheet (%d rows)", len(lines)
@@ -1087,21 +1167,21 @@ def run(args: Any) -> JobResult:
     log.info("input reading: %s", source.name)
     phase_started = time.monotonic()
     sheet = int(args.sheet) if str(args.sheet).isdigit() else args.sheet
-    medius = read_medius(source, sheet)
+    medius_raw = read_medius(source, sheet)
     log.info(
         "input reading complete: %d Medius rows in %.2fs",
-        len(medius),
+        len(medius_raw),
         time.monotonic() - phase_started,
     )
-    invalid_medius = int(medius["_amount_invalid"].sum())
-    missing_medius = int(medius[M_AMOUNT].isna().sum()) - invalid_medius
+    invalid_medius = int(medius_raw["_amount_invalid"].sum())
+    missing_medius = int(medius_raw[M_AMOUNT].isna().sum()) - invalid_medius
     log.info(
         "Medius amounts: %d invalid, %d missing",
         invalid_medius,
         missing_medius,
     )
-    original_medius_rows = len(medius)
-    medius = _eligible_medius(medius).reset_index(drop=True)
+    original_medius_rows = len(medius_raw)
+    medius = _eligible_medius(medius_raw).reset_index(drop=True)
     excluded_medius_rows = original_medius_rows - len(medius)
     log.info(
         "Medius filtering complete: excluded %d zero/inactive lines; %d rows remain",
@@ -1112,7 +1192,7 @@ def run(args: Any) -> JobResult:
         raise ValueError(
             "Medius data is empty after excluding lines with confirmed amount 0 and line Active No"
         )
-    sql_path = Path(__file__).parents[3] / "sql" / "lara_medius_reconciliation.sql"
+    sql_path = Path(__file__).parents[3] / "sql" / "lara_medius_reconciliation_v2.sql"
     sql = sql_path.read_text(encoding="utf-8")
     raw = fetch_oracle(
         DATABASE_NAME, sql, args.lookback_days, args.max_rows, args.db_timeout_seconds
@@ -1129,7 +1209,7 @@ def run(args: Any) -> JobResult:
     )
     log.info("PO header reconciliation started")
     phase_started = time.monotonic()
-    headers = reconcile_headers(oracle, medius, args.tolerance, as_of=now)
+    headers = reconcile_headers(oracle, medius_raw, args.tolerance, as_of=now)
     log.info(
         "PO header reconciliation complete: %d POs in %.2fs",
         len(headers),
