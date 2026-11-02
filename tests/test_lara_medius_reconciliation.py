@@ -66,6 +66,48 @@ def test_created_before_today_missing_po_is_false():
     assert line["Item Line Status"] is False or line["Item Line Status"] == False
     assert header["Comments"] == "PO is missing in Medius"
     assert line["Comments"] == "PO is missing in Medius"
+
+
+def test_header_amount_uses_only_active_medius_lines():
+    o = oracle(
+        [
+            [1, "PO1", "1", "C1", "EUR", 10, None, None, "CONT1", datetime(2024, 1, 1)],
+            [2, "PO1", "2", "C2", "EUR", 20, None, None, "CONT2", datetime(2024, 1, 1)],
+        ]
+    )
+    m = medius(
+        [
+            ["PO1", "C1", 10, "CONT1", "2024-01-01", "Yes"],
+            ["PO1", "C2", 20, "CONT2", "2024-01-01", "No"],
+        ]
+    )
+
+    header = job.reconcile_headers(o, m, .01).iloc[0]
+
+    assert header["Medius PO Amount"] == pytest.approx(10)
+
+
+def test_missing_po_on_last_cutoff_date_uses_delayed_import_message():
+    o = oracle(
+        [[1, "PO1", "1", "C1", "EUR", 10, None, None, "CONT1", datetime(2026, 11, 1, 12)]]
+    )
+    m = medius([["OTHER", "C1", 10, "CONT1", "2026-11-02", "Yes"]])
+
+    header = job.reconcile_headers(
+        o, m, .01, as_of=datetime(2026, 11, 2, 13)
+    ).iloc[0]
+
+    assert header["_reasons"] == ("PO_MISSING_IMPORT_DELAY",)
+    assert header["Comments"] == "PO is missing in Medius"
+    lines = pd.DataFrame(
+        [{"trepa_to_number": "PO1", "Item Line Status": True, "Comments": ""}]
+    )
+    updated, _ = job.add_lif2_comments(
+        pd.DataFrame([header]), lines, {}, lif2_supplied=True
+    )
+    assert updated.iloc[0]["Comments"] == (
+        "MEDIUS ERROR: PO is missing in MEDIUS due to delay in import."
+    )
 def test_po_amount_mismatch(): assert "PO Amount" in job.reconcile_headers(oracle(),medius([["PO1","C1",12,"CONT1","2024-01-01","Yes"]]),.01).iloc[0].Comments
 def test_charge_set_mismatch(): assert "Charge Code" in job.reconcile_headers(oracle(),medius([["PO1","C2",10,"CONT1","2024-01-01","Yes"]]),.01).iloc[0].Comments
 def test_additional_number_mismatch_fails_line_match():

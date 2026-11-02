@@ -12,7 +12,7 @@ import html
 import logging
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -409,7 +409,16 @@ def add_lif2_comments(
             )
             parts = list(lif2_text)
             if existing_text:
-                parts.append(f"MEDIUS ERROR: {existing_text}")
+                delayed_import = (
+                    "PO_MISSING_IMPORT_DELAY" in row.get("_reasons", ())
+                    and not lif2_text
+                    and lif2_supplied
+                )
+                parts.append(
+                    "MEDIUS ERROR: PO is missing in MEDIUS due to delay in import."
+                    if delayed_import
+                    else f"MEDIUS ERROR: {existing_text}"
+                )
             return "\n".join(dict.fromkeys(parts))
 
         result["Comments"] = result.apply(append_comments, axis=1)
@@ -548,6 +557,19 @@ def is_created_today(value: Any, as_of: datetime) -> bool:
         return False
 
 
+def is_created_on_last_cutoff_date(value: Any, as_of: datetime) -> bool:
+    """Return True when an Oracle timestamp falls on the report's last cutoff date."""
+    if value is None or pd.isna(value):
+        return False
+    cutoff = as_of.replace(hour=22, minute=0, second=0, microsecond=0)
+    if as_of < cutoff:
+        cutoff -= timedelta(days=1)
+    try:
+        return pd.Timestamp(value).date() == cutoff.date()
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
 def reconcile_headers(
     oracle: pd.DataFrame,
     medius: pd.DataFrame,
@@ -570,8 +592,13 @@ def reconcile_headers(
         )
         .reset_index()
     )
+    active_medius = medius.copy()
+    active_values = active_medius[M_ACTIVE].map(
+        lambda value: normalize_identifier(value, casefold=True)
+    )
+    active_medius.loc[active_values.ne("yes"), M_AMOUNT] = np.nan
     mg = (
-        medius.groupby(f"_{M_PO}_key", dropna=False, sort=True)
+        active_medius.groupby(f"_{M_PO}_key", dropna=False, sort=True)
         .agg(
             **{
                 MEDIUS_LABELS[0]: (M_PO, "first"),
@@ -594,6 +621,8 @@ def reconcile_headers(
         if r["_merge"] == "left_only":
             if is_created_today(r["created_date"], as_of):
                 return ("PO_AWAITING_MEDIUS",)
+            if is_created_on_last_cutoff_date(r["created_date"], as_of):
+                return ("PO_MISSING_IMPORT_DELAY",)
             return ("PO_MISSING",)
         result = []
         if pd.isna(r["PO Amount"]):
@@ -614,6 +643,7 @@ def reconcile_headers(
     labels = {
         "PO_AWAITING_MEDIUS": "PO awaiting Medius import — created today",
         "PO_MISSING": "PO is missing in Medius",
+        "PO_MISSING_IMPORT_DELAY": "PO is missing in Medius",
         "AMOUNT_MISMATCH": "PO Amount is unmatched",
         "ORACLE_AMOUNT_MISSING": "Oracle PO amount is missing",
         "MEDIUS_AMOUNT_MISSING": "Medius PO amount is missing",
