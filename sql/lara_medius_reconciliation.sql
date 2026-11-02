@@ -1,4 +1,12 @@
-with latest as (
+with boundaries as (
+   select trunc(sysdate) + 22 / 24
+          - case
+               when sysdate < trunc(sysdate) + 22 / 24 then 1
+               else 0
+            end as end_date
+     from dual
+),
+latest as (
    select trepa_uid
      from (
       select tep.trepa_uid,
@@ -8,8 +16,14 @@ with latest as (
                            tep.trepa_uid desc
              ) as rn
         from sce.trepa_events_payload tep
-       where tep.created_date >= trunc(sysdate) - :lookback_days
-         and tep.created_date < trunc(sysdate)
+       where tep.created_date >= (
+                 select end_date - :lookback_days
+                   from boundaries
+             )
+         and tep.created_date < (
+                 select end_date
+                   from boundaries
+             )
    )
     where rn = 1
 )
