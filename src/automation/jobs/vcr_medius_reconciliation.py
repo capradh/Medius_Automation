@@ -504,6 +504,12 @@ def add_comments(frame: pd.DataFrame, lif2: dict[str, list[str]]) -> pd.DataFram
         if not reasons:
             return ""
         texts = lif2.get(str(row.po_identifier_sq), []).copy()
+        if "PO_MISSING_MEDIUS" in reasons:
+            reasons = ("PO_MISSING_MEDIUS",)
+        else:
+            reasons = tuple(
+                code for code in reasons if code != "CHARGE_CODE_MISMATCH"
+            )
         texts.extend(f"MEDIUS ERROR: {REASON_TEXT[code]}" for code in reasons)
         return "\n".join(dict.fromkeys(texts))
 

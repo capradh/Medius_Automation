@@ -249,6 +249,19 @@ def test_po_amounts_are_grouped_and_statuses_are_boolean():
     assert "MEDIUS ERROR: PO Amount is unmatched" in report.iloc[0]["Comments"]
 
 
+def test_po_missing_comment_excludes_charge_code_error():
+    stamp = datetime(2026, 10, 26, 12, 0)
+    result, _ = job.reconcile(
+        oracle([["PO1", "C1", 10, stamp]]),
+        medius([["X;OTHER;Z", "C2", 10]]),
+        0.01,
+    )
+
+    report = job.presentation(job.add_comments(result, {}))
+
+    assert report.iloc[0]["Comments"] == "MEDIUS ERROR: PO is missing in Medius"
+
+
 def test_decimal_line_difference_uses_oracle_amount_without_rounding():
     stamp = datetime(2026, 10, 26, 12, 0)
     result, _ = job.reconcile(
