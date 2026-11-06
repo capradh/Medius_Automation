@@ -1,7 +1,7 @@
 r"""Update Medius user Roles and Authorization Groups from an Excel access matrix.
 
 Excel layout: CCGID | Username | First Name | Last Name | Email | Company Code | <role columns> | ;<auth group columns>
-Cell x/X = assign, N/A or blank = ignore.
+Cell x/X = assign, blank = ignore, and NA or N/A = remove.
 Only users with an @cma-cgm.com email get payloads; users with any other domain are
 left out of the JSON payloads and reported as errors (summary + Excel report).
 
@@ -87,6 +87,7 @@ EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 ALLOWED_EMAIL_DOMAIN = "cma-cgm.com"  # exact match, case-insensitive
 ASSIGN_MARKS = frozenset({"X", "\u00d7"})
 IGNORE_MARKS = frozenset({"", "N/A", "NA", "N.A.", "N.A", "N\\A", "-", "--", "#N/A"})
+REMOVAL_MARKS = frozenset({"NA", "N/A"})
 _CYRILLIC_TO_LATIN = str.maketrans({"\u0425": "X", "\u0445": "X"})
 _INVISIBLE_RE = re.compile("[\u200b\u200c\u200d\u2060\ufeff]")
 _FLOAT_ID_RE = re.compile(r"^(\d+)\.0+$")
@@ -127,6 +128,8 @@ class AccessRow:
     company: str
     roles: List[str] = field(default_factory=list)
     groups: List[str] = field(default_factory=list)
+    roles_to_remove: List[str] = field(default_factory=list)
+    groups_to_remove: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -424,7 +427,7 @@ def _marked(
                     "ERROR",
                     f"Unexpected value '{cells[pos]}' in column "
                     f"{get_column_letter(pos + 1)} '{label}' "
-                    "(use x, N/A or blank).",
+                    "(use x, NA, N/A or blank).",
                     excel_row,
                 )
             )
@@ -485,9 +488,13 @@ def parse_users(
         for role, positions in cmap.roles.items():
             if _marked(cells, positions, role, excel_row, issues):
                 access.roles.append(role)
+            if any(_mark(cells[pos]) in REMOVAL_MARKS for pos in positions):
+                access.roles_to_remove.append(role)
         for group, positions in cmap.groups.items():
             if _marked(cells, positions, ";" + group, excel_row, issues):
                 access.groups.append(group)
+            if any(_mark(cells[pos]) in REMOVAL_MARKS for pos in positions):
+                access.groups_to_remove.append(group)
         if not row_ok:
             continue
         last_identity = (excel_row, {f: vals[f] for f in IDENTITY_FIELDS})
@@ -543,7 +550,12 @@ def parse_users(
                     excel_row,
                 )
             )
-        if not access.roles and not access.groups:
+        if (
+            not access.roles
+            and not access.groups
+            and not access.roles_to_remove
+            and not access.groups_to_remove
+        ):
             issues.append(
                 Issue(
                     "WARNING",
@@ -639,6 +651,15 @@ def build_roles_payload(
             for row in u.rows
             for role in row.roles
         ]
+        roles.extend(
+            {
+                "roleCompany": row.company,
+                "roleName": role,
+                "toBeRemoved": True,
+            }
+            for row in u.rows
+            for role in row.roles_to_remove
+        )
         if not roles:
             continue
         payload.append(
@@ -672,7 +693,7 @@ def build_auth_groups_payload(
     payload: List[Dict[str, Any]] = []
     for u in users:
         for row in u.rows:
-            if not row.groups:
+            if not row.groups and not row.groups_to_remove:
                 continue
             payload.append(
                 {
@@ -686,6 +707,14 @@ def build_auth_groups_payload(
                             "toBeRemoved": False,
                         }
                         for g in row.groups
+                    ]
+                    + [
+                        {
+                            "companyId": row.company,
+                            "authorizationGroupName": g,
+                            "toBeRemoved": True,
+                        }
+                        for g in row.groups_to_remove
                     ],
                 }
             )
