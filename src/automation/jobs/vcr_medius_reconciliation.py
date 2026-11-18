@@ -42,6 +42,7 @@ MEDIUS_REQUIRED = {
 }
 OUTPUT_COLUMNS = [
     "po_identifier_sq",
+    "country_code",
     "chargeCode",
     "PO Header Amount",
     "PO Line Amount",
@@ -216,44 +217,48 @@ def normalize_timestamps(values: pd.Series) -> pd.Series:
     return pd.to_datetime(values, errors="coerce", utc=True).dt.tz_convert(None)
 
 
+def normalize_po_match_id(value: Any) -> Any:
+    value = normalize_identifier(value)
+    if pd.isna(value):
+        return pd.NA
+    return str(value).lstrip("0") or "0"
+
+
 def read_lif2(path: Path) -> dict[str, list[str]]:
     validate_workbook(path)
     messages: dict[str, list[str]] = {}
     try:
         with pd.ExcelFile(path) as book:
-            for sheet in ("INVOICE DETAILS", "TRANSFER DETAILS"):
+            sheet_filters = {
+                "INVOICE DETAILS": ("bit_class", "VCRP", "source_id"),
+                "TRANSFER DETAILS": (
+                    "source_transaction_type",
+                    "ZVCRP",
+                    "source_transaction_id",
+                ),
+            }
+            for sheet, (type_col, expected_type, po_col) in sheet_filters.items():
                 if sheet not in book.sheet_names:
                     raise ReconciliationError(
                         f"Lif2 workbook is missing sheet {sheet!r}"
                     )
                 raw = book.parse(sheet, dtype=object)
                 raw.columns = [normalized_header(c) for c in raw.columns]
-                po_col = next(
-                    (
-                        c
-                        for c in raw.columns
-                        if c
-                        in {
-                            "po_identifier_sq",
-                            "po_id",
-                            "vcr_po_id",
-                            "source_id",
-                            "source_transaction_id",
-                        }
-                    ),
-                    None,
-                )
                 msg_col = next(
                     (c for c in raw.columns if c in {"message_text", "message"}),
                     None,
                 )
-                if not po_col or not msg_col:
+                if type_col not in raw.columns or po_col not in raw.columns or not msg_col:
                     raise ReconciliationError(
-                        f"Lif2 sheet {sheet!r} needs a PO ID and Message Text column. "
+                        f"Lif2 sheet {sheet!r} needs {type_col}, {po_col}, "
+                        "and Message Text columns. "
                         f"Detected columns: {list(raw.columns)}"
                     )
-                for po, message in zip(raw[po_col], raw[msg_col]):
-                    po_id, text = normalize_identifier(po), visible_text(message)
+                for po, source_type, message in zip(raw[po_col], raw[type_col], raw[msg_col]):
+                    row_type = normalize_identifier(source_type)
+                    if pd.isna(row_type) or str(row_type).upper() != expected_type:
+                        continue
+                    po_id, text = normalize_po_match_id(po), visible_text(message)
                     if pd.notna(po_id) and pd.notna(text):
                         messages.setdefault(str(po_id), []).append(f"{sheet}: {text}")
     except ReconciliationError:
@@ -271,6 +276,7 @@ def normalize_oracle(frame: pd.DataFrame) -> tuple[pd.DataFrame, int]:
     frame = frame.rename(columns=aliases)
     needed = {
         "po_identifier_sq",
+        "country_code",
         "charge_code",
         "total_line_amount",
         "last_update_date",
@@ -281,6 +287,7 @@ def normalize_oracle(frame: pd.DataFrame) -> tuple[pd.DataFrame, int]:
     if frame.empty:
         raise ReconciliationError("Oracle query returned no rows")
     frame["po_identifier_sq"] = frame["po_identifier_sq"].map(normalize_identifier)
+    frame["country_code"] = frame["country_code"].map(normalize_identifier)
     frame["charge_code"] = frame["charge_code"].map(normalize_identifier)
     frame["total_line_amount"] = frame["total_line_amount"].map(parse_amount)
     frame["last_update_date"] = normalize_timestamps(frame["last_update_date"])
@@ -300,6 +307,7 @@ def aggregate_oracle_charge_lines(frame: pd.DataFrame) -> pd.DataFrame:
             as_index=False,
         )
         .agg(
+            country_code=("country_code", "first"),
             total_line_amount=("total_line_amount", lambda amounts: amounts.sum(min_count=1)),
             last_update_date=("last_update_date", "max"),
             _oracle_order=("_oracle_order", "min"),
@@ -503,7 +511,8 @@ def add_comments(frame: pd.DataFrame, lif2: dict[str, list[str]]) -> pd.DataFram
         reasons = row["reason_codes"]
         if not reasons:
             return ""
-        texts = lif2.get(str(row.po_identifier_sq), []).copy()
+        po_id = normalize_po_match_id(row.po_identifier_sq)
+        texts = lif2.get(str(po_id), []).copy() if pd.notna(po_id) else []
         if "PO_MISSING_MEDIUS" in reasons:
             reasons = ("PO_MISSING_MEDIUS",)
         else:
@@ -521,6 +530,7 @@ def presentation(frame: pd.DataFrame) -> pd.DataFrame:
     output = pd.DataFrame(
         {
             "po_identifier_sq": frame["po_identifier_sq"],
+            "country_code": frame["country_code"],
             "chargeCode": frame["charge_code"],
             "PO Header Amount": frame["oracle_po_amount"],
             "PO Line Amount": frame["oracle_charge_amount"],
@@ -656,13 +666,13 @@ def write_workbook(
     wb = Workbook()
     ws = wb.active
     ws.title = "PO Reconciliation"
-    ws.merge_cells("A1:E1")
+    ws.merge_cells("A1:F1")
     ws["A1"] = "VCR"
-    ws.merge_cells("F1:I1")
-    ws["F1"] = "Medius"
-    ws.merge_cells("J1:N1")
-    ws["J1"] = "Reconciliation"
-    for cell in (ws["A1"], ws["F1"], ws["J1"]):
+    ws.merge_cells("G1:J1")
+    ws["G1"] = "Medius"
+    ws.merge_cells("K1:O1")
+    ws["K1"] = "Reconciliation"
+    for cell in (ws["A1"], ws["G1"], ws["K1"]):
         cell.font = Font(bold=True)
         cell.alignment = Alignment(horizontal="center")
         cell.fill = PatternFill("solid", fgColor="D9EAF7")

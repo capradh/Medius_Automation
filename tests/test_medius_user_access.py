@@ -81,6 +81,39 @@ def test_user_without_roles_not_in_roles_payload():
     assert len(build_auth_groups_payload(users, "IT_CAP")) == 1
 
 
+def test_na_values_are_included_as_removals():
+    rows = [["1", "jdoe", "John", "Doe", "a@company.com", "0089", "NA", "", "NA", ""]]
+    users, issues = _parse(rows)
+    assert not _errors(issues)
+
+    roles = build_roles_payload(users, ENV, "IT_CAP")
+    assert roles[0]["roles"] == [
+        {"roleCompany": "0089", "roleName": "Buyer", "toBeRemoved": True}
+    ]
+
+    groups = build_auth_groups_payload(users, "IT_CAP")
+    assert groups[0]["authorizationGroups"] == [
+        {
+            "companyId": "0089",
+            "authorizationGroupName": "GrpA",
+            "toBeRemoved": True,
+        }
+    ]
+
+
+def test_n_a_values_are_included_as_removals():
+    rows = [["1", "jdoe", "John", "Doe", "a@company.com", "0089", "N/A", "", "N/A", ""]]
+    users, issues = _parse(rows)
+    assert not _errors(issues)
+    assert build_roles_payload(users, ENV, "IT_CAP")[0]["roles"][0]["toBeRemoved"] is True
+    assert (
+        build_auth_groups_payload(users, "IT_CAP")[0]["authorizationGroups"][0][
+            "toBeRemoved"
+        ]
+        is True
+    )
+
+
 def test_fullwidth_x_assigns():
     rows = [["1", "jdoe", "John", "Doe", "a@company.com", "0089", "\uff38", "", "", ""]]
     users, issues = _parse(rows)

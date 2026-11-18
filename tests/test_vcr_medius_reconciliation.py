@@ -9,11 +9,13 @@ from automation.jobs import vcr_medius_reconciliation as job
 
 
 def oracle(rows):
+    rows = [row if len(row) == 5 else [row[0], None, *row[1:]] for row in rows]
     return job.normalize_oracle(
         pd.DataFrame(
             rows,
             columns=[
                 "po_identifier_sq",
+                "country_code",
                 "charge_code",
                 "total_line_amount",
                 "last_update_date",
@@ -66,6 +68,55 @@ def test_normalize_medius_excludes_dummy_external_system_ids():
     assert normalized.iloc[0]["external_po_id"] == "93568"
     assert normalized.iloc[0]["ordered_amount"] == 100
     assert invalid == 0
+
+
+def test_lif2_comments_use_sheet_specific_filters_and_normalize_po_ids(tmp_path):
+    invoice_rows = pd.DataFrame(
+        [
+            ["0000000000000000084582", "VCRP", "Invoice VCR error"],
+            ["84582", "OTHER", "Ignore this invoice error"],
+        ],
+        columns=[
+            "Source ID",
+            "BIT Class",
+            "Message Text",
+        ],
+    )
+    transfer_rows = pd.DataFrame(
+        [
+            ["0000000000000000084582", "ZVCRP", "Transfer VCR error"],
+            ["84582", "OTHER", "Ignore this transfer error"],
+        ],
+        columns=[
+            "Source Transaction ID",
+            "Source Transaction Type",
+            "Message Text",
+        ],
+    )
+    path = tmp_path / "lif2.xlsx"
+    with pd.ExcelWriter(path) as writer:
+        invoice_rows.to_excel(writer, sheet_name="INVOICE DETAILS", index=False)
+        transfer_rows.to_excel(writer, sheet_name="TRANSFER DETAILS", index=False)
+
+    lif2 = job.read_lif2(path)
+    result = job.add_comments(
+        pd.DataFrame(
+            [{"po_identifier_sq": "84582", "reason_codes": ("PO_MISSING_MEDIUS",)}]
+        ),
+        lif2,
+    )
+
+    assert lif2 == {
+        "84582": [
+            "INVOICE DETAILS: Invoice VCR error",
+            "TRANSFER DETAILS: Transfer VCR error",
+        ]
+    }
+    assert result.iloc[0]["comments"] == (
+        "INVOICE DETAILS: Invoice VCR error\n"
+        "TRANSFER DETAILS: Transfer VCR error\n"
+        "MEDIUS ERROR: PO is missing in Medius"
+    )
 
 
 def test_reconcile_status_is_row_level_and_does_not_expand_oracle_rows():
@@ -129,6 +180,22 @@ def test_oracle_charge_lines_are_aggregated_before_reconciliation():
     assert len(result) == 2
     assert result["po_identifier_sq"].value_counts().to_dict() == {"93568": 2}
     assert result["line_amount_match"].all()
+
+
+def test_country_code_is_preserved_in_reconciliation_output():
+    stamp = datetime(2026, 10, 26, 12, 0)
+    oracle_data = oracle(
+        [
+            ["PO1", "GB", "C1", 10, stamp],
+            ["PO1", "GB", "C1", 15, stamp],
+        ]
+    )
+    grouped = job.aggregate_oracle_charge_lines(oracle_data)
+    result, _ = job.reconcile(grouped, medius([["X;PO1;Z", "C1", 25]]), 0.01)
+    report = job.presentation(job.add_comments(result, {}))
+
+    assert grouped["country_code"].tolist() == ["GB"]
+    assert report["country_code"].tolist() == ["GB"]
 
 
 def test_repeated_oracle_rows_are_not_multiplied_by_duplicate_medius_rows():
@@ -237,7 +304,7 @@ def test_po_amounts_are_grouped_and_statuses_are_boolean():
 
     result, _ = job.reconcile(oracle_data, medius_data, 0.01)
     result = job.add_comments(result, {})
-    report = job.presentation(result)
+    report = job.presentation(job.add_comments(result, {}))
 
     assert result["oracle_po_amount"].tolist() == [100, 100]
     assert result["medius_po_amount"].tolist() == [110, 110]
@@ -282,7 +349,7 @@ def test_decimal_line_difference_uses_oracle_amount_without_rounding():
 
     assert result["po_amount_match"].all()
     assert result["line_amount_match"].all()
-    report = job.presentation(result)
+    report = job.presentation(job.add_comments(result, {}))
     assert report["PO Header Amount"].tolist() == [15327796.5, 8441032.2]
     assert report["Medius PO Amount"].tolist() == [15327796.5, 8441032.2]
     assert report["PO Line Amount"].tolist() == [15327796.5, 8441032.2]
@@ -342,9 +409,10 @@ def test_workbook_has_one_reconciliation_sheet_and_summary(tmp_path):
 
     assert workbook.sheetnames == ["PO Reconciliation", "Summary"]
     sheet = workbook["PO Reconciliation"]
-    assert (sheet["A1"].value, sheet["F1"].value, sheet["J1"].value) == (
+    assert (sheet["A1"].value, sheet["G1"].value, sheet["K1"].value) == (
         "VCR",
         "Medius",
         "Reconciliation",
     )
-    assert [sheet.cell(2, col).value for col in range(1, 15)] == job.OUTPUT_COLUMNS
+    assert [sheet.cell(2, col).value for col in range(1, 16)] == job.OUTPUT_COLUMNS
+    assert "A1:F1" in {str(merged) for merged in sheet.merged_cells.ranges}
