@@ -686,7 +686,17 @@ def reconcile_headers(
         ),
         axis=1,
     )
-    out["Comments"] = out["_reasons"].map(lambda x: "; ".join(labels[y] for y in x))
+
+    def header_comment(row: pd.Series) -> str:
+        if row["_merge"] != "left_only" and pd.isna(row["Medius PO Amount"]):
+            status = normalize_identifier(row["to_status"], casefold=True)
+            if status == "c":
+                return "TO is Cancelled in LARA"
+            if status in {"f", "b"}:
+                return "TO not cancelled in LARA but inactive in Medius"
+        return "; ".join(labels[reason] for reason in row["_reasons"])
+
+    out["Comments"] = out.apply(header_comment, axis=1)
     return out
 
 
